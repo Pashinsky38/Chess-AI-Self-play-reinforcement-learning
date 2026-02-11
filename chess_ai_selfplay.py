@@ -9,6 +9,10 @@ Upgrades in this file:
 - Entropy regularization + gradient clipping (small helpers)
 - Slightly safer save/load (model on CPU)
 - Clearer board_to_tensor indexing (chess.square_file/square_rank)
+
+Added features in this edited version:
+- Board flip toggle (auto-flips when you choose to play as Black)
+- Promotion dialog when a pawn reaches the last rank (choose Q/R/B/N)
 """
 import chess
 import torch
@@ -390,7 +394,7 @@ class ChessAI:
 
 
 # ---------------------------
-# GUI class (unchanged except calling new ai.train)
+# GUI class (modified to support flip + promotion choice)
 # ---------------------------
 class ChessGUI:
     def __init__(self):
@@ -408,6 +412,10 @@ class ChessGUI:
         self.square_size = 60
         self.move_history = []
         self.ai_thinking = False
+        
+        # Board flip state: when True the board is shown from Black's perspective (files/ranks reversed)
+        self.flip_board = False
+        self.flip_var = tk.BooleanVar(value=False)
         
         # Message queue for thread-safe GUI updates
         self.message_queue = queue.Queue()
@@ -480,6 +488,10 @@ class ChessGUI:
         ttk.Button(play_frame, text="AI vs AI Demo", command=self.watch_ai_game, width=20).grid(row=2, column=0, pady=5, padx=5)
         ttk.Button(play_frame, text="New Game", command=self.reset_game, width=20).grid(row=3, column=0, pady=5, padx=5)
         
+        # Flip board option (auto set when playing as black but user can toggle)
+        flip_cb = ttk.Checkbutton(play_frame, text="Flip board (Black at bottom)", variable=self.flip_var, command=self.on_flip_toggle)
+        flip_cb.grid(row=4, column=0, pady=5)
+        
         # Stats display
         stats_frame = ttk.LabelFrame(right_frame, text="Training Statistics", padding="10")
         stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
@@ -498,6 +510,11 @@ class ChessGUI:
         
         self.update_board_display()
         self.update_stats_display()
+    
+    def on_flip_toggle(self):
+        """Called when flip checkbox is toggled"""
+        self.flip_board = bool(self.flip_var.get())
+        self.update_board_display()
     
     def board_to_image(self):
         """Convert chess board to image using PIL with improved rendering"""
@@ -531,8 +548,13 @@ class ChessGUI:
         # Draw squares
         for rank in range(8):
             for file in range(8):
-                x1 = file * self.square_size + offset
-                y1 = (7 - rank) * self.square_size + offset
+                # Map (file, rank) to screen coordinates depending on flip state
+                if not self.flip_board:
+                    x1 = file * self.square_size + offset
+                    y1 = (7 - rank) * self.square_size + offset
+                else:
+                    x1 = (7 - file) * self.square_size + offset
+                    y1 = rank * self.square_size + offset
                 x2 = x1 + self.square_size
                 y2 = y1 + self.square_size
                 
@@ -554,13 +576,21 @@ class ChessGUI:
         files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
         ranks = ['1', '2', '3', '4', '5', '6', '7', '8']
         
+        if self.flip_board:
+            files = list(reversed(files))
+            ranks = list(reversed(ranks))
+        
         for i, file_char in enumerate(files):
             x = i * self.square_size + self.square_size // 2 + offset
             draw.text((x, 5), file_char, fill='black', font=coord_font, anchor='mm')
             draw.text((x, board_size + offset + 15), file_char, fill='black', font=coord_font, anchor='mm')
         
         for i, rank_char in enumerate(ranks):
-            y = (7 - i) * self.square_size + self.square_size // 2 + offset
+            # compute y similar to square mapping
+            if not self.flip_board:
+                y = (7 - i) * self.square_size + self.square_size // 2 + offset
+            else:
+                y = i * self.square_size + self.square_size // 2 + offset
             draw.text((5, y), rank_char, fill='black', font=coord_font, anchor='mm')
             draw.text((board_size + offset + 15, y), rank_char, fill='black', font=coord_font, anchor='mm')
         
@@ -580,8 +610,13 @@ class ChessGUI:
                     symbol = piece.symbol()
                     piece_char = piece_symbols.get(symbol, symbol)
                     
-                    x = file * self.square_size + self.square_size // 2 + offset
-                    y = (7 - rank) * self.square_size + self.square_size // 2 + offset
+                    # Map to screen coords
+                    if not self.flip_board:
+                        x = file * self.square_size + self.square_size // 2 + offset
+                        y = (7 - rank) * self.square_size + self.square_size // 2 + offset
+                    else:
+                        x = (7 - file) * self.square_size + self.square_size // 2 + offset
+                        y = rank * self.square_size + self.square_size // 2 + offset
                     
                     # Piece color
                     piece_color = 'white' if piece.color == chess.WHITE else 'black'
@@ -666,8 +701,14 @@ Model Location:
         if x < 0 or y < 0 or x >= self.square_size * 8 or y >= self.square_size * 8:
             return
         
-        file = min(7, max(0, x // self.square_size))
-        rank = min(7, max(0, 7 - (y // self.square_size)))
+        col = int(min(7, max(0, x // self.square_size)))
+        row = int(min(7, max(0, y // self.square_size)))
+        if not self.flip_board:
+            file = col
+            rank = 7 - row
+        else:
+            file = 7 - col
+            rank = row
         square = chess.square(file, rank)
         
         if self.selected_square is None:
@@ -689,8 +730,11 @@ Model Location:
             # Check for promotion
             piece = self.board.piece_at(self.selected_square)
             if piece and piece.piece_type == chess.PAWN and (rank == 0 or rank == 7):
-                # Pawn promotion - default to queen
-                move = chess.Move(self.selected_square, square, promotion=chess.QUEEN)
+                # Pawn promotion - ask user which piece
+                promo = self.ask_promotion_piece()
+                if promo is None:
+                    promo = chess.QUEEN
+                move = chess.Move(self.selected_square, square, promotion=promo)
             else:
                 move = chess.Move(self.selected_square, square)
             
@@ -711,6 +755,37 @@ Model Location:
                 self.legal_moves_for_selected = []
                 self.status_var.set("Illegal move! Click a piece to select it.")
                 self.update_board_display()
+    
+    def ask_promotion_piece(self):
+        """Show a small modal dialog asking user what to promote to.
+        Returns one of chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT or None if cancelled.
+        """
+        dlg = tk.Toplevel(self.window)
+        dlg.title("Choose Promotion")
+        dlg.transient(self.window)
+        dlg.grab_set()
+        choice = {'piece': None}
+        
+        ttk.Label(dlg, text="Promote pawn to:", padding=10).grid(row=0, column=0, columnspan=4)
+        
+        def choose(piece_const):
+            choice['piece'] = piece_const
+            dlg.destroy()
+        
+        # Buttons with text and unicode pieces
+        ttk.Button(dlg, text="Queen ♕", width=12, command=lambda: choose(chess.QUEEN)).grid(row=1, column=0, padx=5, pady=5)
+        ttk.Button(dlg, text="Rook ♖", width=12, command=lambda: choose(chess.ROOK)).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(dlg, text="Bishop ♗", width=12, command=lambda: choose(chess.BISHOP)).grid(row=1, column=2, padx=5, pady=5)
+        ttk.Button(dlg, text="Knight ♘", width=12, command=lambda: choose(chess.KNIGHT)).grid(row=1, column=3, padx=5, pady=5)
+        
+        # Center the dialog over parent
+        self.window.update_idletasks()
+        x = self.window.winfo_rootx() + 100
+        y = self.window.winfo_rooty() + 100
+        dlg.geometry(f"+{x}+{y}")
+        
+        dlg.wait_window()
+        return choice['piece']
     
     def make_move(self, move):
         """Make a move on the board and update history"""
@@ -754,6 +829,10 @@ Model Location:
         self.move_history = []
         self.ai_thinking = False
         
+        # Auto flip board if human chooses Black; user can toggle afterward
+        self.flip_board = (human_color == chess.BLACK)
+        self.flip_var.set(self.flip_board)
+        
         self.update_board_display()
         self.update_move_history()
         
@@ -771,6 +850,10 @@ Model Location:
         self.legal_moves_for_selected = []
         self.move_history = []
         self.ai_thinking = False
+        
+        # don't flip by default for AI vs AI
+        self.flip_board = False
+        self.flip_var.set(self.flip_board)
         
         self.update_board_display()
         self.update_move_history()
@@ -801,6 +884,10 @@ Model Location:
         self.legal_moves_for_selected = []
         self.move_history = []
         self.ai_thinking = False
+        
+        # reset flip
+        self.flip_board = False
+        self.flip_var.set(False)
         
         self.update_board_display()
         self.update_move_history()
