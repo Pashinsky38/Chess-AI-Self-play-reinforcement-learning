@@ -851,19 +851,6 @@ Model Location:
 
 
 if __name__ == "__main__":
-    print("Chess AI - Self-Play Reinforcement Learning (IMPROVED VERSION)")
-    print("=" * 60)
-    print("Required packages: python-chess, torch, pillow, numpy")
-    print("Install with: pip install python-chess torch pillow numpy")
-    print("=" * 60)
-    print("\nIMPROVEMENTS:")
-    print("✓ Threading - Training won't freeze the GUI")
-    print("✓ Visual feedback - Selected squares and legal moves highlighted")
-    print("✓ Move history - See all moves in SAN notation")
-    print("✓ Better error handling - More robust and informative")
-    print("✓ Improved board rendering - Better visuals with coordinates")
-    print("✓ Stop training - Actually works now!")
-    print("=" * 60)
-    
+
     gui = ChessGUI()
     gui.run()
