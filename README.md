@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 Or install manually:
 ```bash
-pip install python-chess torch pillow cairosvg numpy
+pip install python-chess torch pillow numpy
 ```
 
 2. **Run the program:**
@@ -131,14 +131,6 @@ This is a simplified implementation for educational purposes:
 
 ## Troubleshooting
 
-### Board Display Issues
-If the board doesn't display correctly, make sure cairosvg is installed:
-```bash
-pip install cairosvg
-```
-
-On some systems, you may need additional dependencies for cairosvg.
-
 ### Memory Issues
 If training runs out of memory:
 - Reduce the number of games per training session
@@ -192,6 +184,6 @@ Built using:
 - [python-chess](https://python-chess.readthedocs.io/) for chess game logic
 - [PyTorch](https://pytorch.org/) for neural network
 - [tkinter](https://docs.python.org/3/library/tkinter.html) for GUI
-- [CairoSVG](https://cairosvg.org/) for board rendering
+- [Pillow](https://pillow.readthedocs.io/) for board rendering
 
 Inspired by AlphaZero and other self-play reinforcement learning approaches.

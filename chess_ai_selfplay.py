@@ -1,10 +1,10 @@
 """
 Chess AI with Self-Play Reinforcement Learning
 Uses a neural network that learns by playing against itself
+Windows-compatible version - no cairosvg required!
 """
 
 import chess
-import chess.svg
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,9 +15,7 @@ import os
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
-from PIL import Image, ImageTk
-import io
-import cairosvg
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 # Neural Network Architecture
 class ChessNet(nn.Module):
@@ -347,10 +345,72 @@ class ChessGUI:
         self.board_label.bind("<Button-1>", self.on_board_click)
     
     def board_to_image(self):
-        """Convert chess board to image"""
-        svg_data = chess.svg.board(board=self.board, size=500)
-        png_data = cairosvg.svg2png(bytestring=svg_data.encode('utf-8'))
-        image = Image.open(io.BytesIO(png_data))
+        """Convert chess board to image using PIL"""
+        square_size = 60
+        board_size = square_size * 8
+        
+        # Create image
+        image = Image.new('RGB', (board_size, board_size), 'white')
+        draw = ImageDraw.Draw(image)
+        
+        # Colors
+        light_square = (240, 217, 181)
+        dark_square = (181, 136, 99)
+        highlight_color = (255, 255, 0, 128)
+        
+        # Draw squares
+        for rank in range(8):
+            for file in range(8):
+                x1 = file * square_size
+                y1 = (7 - rank) * square_size
+                x2 = x1 + square_size
+                y2 = y1 + square_size
+                
+                # Determine square color
+                if (rank + file) % 2 == 0:
+                    color = light_square
+                else:
+                    color = dark_square
+                
+                draw.rectangle([x1, y1, x2, y2], fill=color)
+                
+                # Highlight selected square
+                square = chess.square(file, rank)
+                if square == self.selected_square:
+                    draw.rectangle([x1, y1, x2, y2], outline='yellow', width=3)
+        
+        # Unicode chess pieces
+        piece_symbols = {
+            'P': '♙', 'N': '♘', 'B': '♗', 'R': '♖', 'Q': '♕', 'K': '♔',
+            'p': '♟', 'n': '♞', 'b': '♝', 'r': '♜', 'q': '♛', 'k': '♚'
+        }
+        
+        # Try to load a font, fallback to default
+        try:
+            font = ImageFont.truetype("arial.ttf", 40)
+        except:
+            try:
+                font = ImageFont.truetype("Arial.ttf", 40)
+            except:
+                font = ImageFont.load_default()
+        
+        # Draw pieces
+        for rank in range(8):
+            for file in range(8):
+                square = chess.square(file, rank)
+                piece = self.board.piece_at(square)
+                
+                if piece:
+                    symbol = piece.symbol()
+                    piece_char = piece_symbols.get(symbol, symbol)
+                    
+                    x = file * square_size + square_size // 2
+                    y = (7 - rank) * square_size + square_size // 2
+                    
+                    # Draw piece
+                    draw.text((x, y), piece_char, fill='black' if piece.color else 'white', 
+                             font=font, anchor='mm')
+        
         return ImageTk.PhotoImage(image)
     
     def update_board_display(self):
@@ -388,10 +448,9 @@ Model Directory: {self.ai.save_dir}
         if self.board.is_game_over():
             return
         
-        # Calculate which square was clicked (approximate)
-        # This is a simplified version - proper implementation would need exact coordinate mapping
+        # Calculate which square was clicked
+        square_size = 60
         x, y = event.x, event.y
-        square_size = 500 // 8
         file = min(7, max(0, x // square_size))
         rank = min(7, max(0, 7 - (y // square_size)))
         square = chess.square(file, rank)
@@ -549,8 +608,8 @@ Model Directory: {self.ai.save_dir}
 if __name__ == "__main__":
     print("Chess AI - Self-Play Reinforcement Learning")
     print("=" * 50)
-    print("Required packages: python-chess, torch, pillow, cairosvg")
-    print("Install with: pip install python-chess torch pillow cairosvg")
+    print("Required packages: python-chess, torch, pillow, numpy")
+    print("Install with: pip install python-chess torch pillow numpy")
     print("=" * 50)
     
     gui = ChessGUI()
