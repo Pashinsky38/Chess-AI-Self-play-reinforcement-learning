@@ -2,12 +2,19 @@
 Chess AI with Self-Play Reinforcement Learning
 IMPROVED VERSION with enhanced GUI and user experience
 Windows-compatible version - no cairosvg required!
-"""
 
+Upgrades in this file:
+- Replay buffer + minibatch training
+- Advantage normalization (per-batch)
+- Entropy regularization + gradient clipping (small helpers)
+- Slightly safer save/load (model on CPU)
+- Clearer board_to_tensor indexing (chess.square_file/square_rank)
+"""
 import chess
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 import random
 import pickle
@@ -18,6 +25,7 @@ from tkinter import ttk, messagebox, scrolledtext
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import threading
 import queue
+from collections import deque
 
 # Neural Network Architecture
 class ChessNet(nn.Module):
@@ -28,6 +36,7 @@ class ChessNet(nn.Module):
         self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         
+        # keep flatten for now (you can replace with global pool later)
         self.fc1 = nn.Linear(128 * 8 * 8, 512)
         
         # Policy head (move probabilities)
@@ -61,7 +70,9 @@ class ChessNet(nn.Module):
 
 
 class ChessAI:
-    def __init__(self, save_dir="chess_ai_models"):
+    def __init__(self, save_dir="chess_ai_models",
+                 replay_capacity=20000, batch_size=128, train_steps_per_game=4,
+                 entropy_coef=0.01, value_coef=1.0, clip_grad=1.0, min_buffer_size=512):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
@@ -75,15 +86,31 @@ class ChessAI:
         }
         self.stop_training_flag = False
         
+        # Replay buffer parameters
+        self.replay_capacity = replay_capacity
+        self.replay_buffer = deque(maxlen=replay_capacity)  # stores (board_tensor_cpu, move_idx, target_value)
+        self.batch_size = batch_size
+        self.train_steps_per_game = train_steps_per_game
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.clip_grad = clip_grad
+        self.min_buffer_size = min_buffer_size
+        
         # Create save directory if it doesn't exist
         os.makedirs(save_dir, exist_ok=True)
         
         # Try to load existing model
         self.load_model()
     
+    # ---------------------------
+    # Board / move encoding
+    # ---------------------------
     def board_to_tensor(self, board):
-        """Convert chess board to neural network input tensor"""
-        # 12 channels: 6 piece types * 2 colors
+        """Convert chess board to neural network input tensor.
+        Uses clear mapping: tensor[channel, rank, file], where
+        file = 0..7 (a..h), rank = 0..7 (1..8)
+        Returns FloatTensor shape (1,12,8,8) on self.device
+        """
         tensor = np.zeros((12, 8, 8), dtype=np.float32)
         
         piece_to_channel = {
@@ -91,85 +118,101 @@ class ChessAI:
             chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
         }
         
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece:
-                channel = piece_to_channel[piece.piece_type]
-                if piece.color == chess.BLACK:
-                    channel += 6
-                row, col = divmod(square, 8)
-                tensor[channel, row, col] = 1.0
+        for sq in chess.SQUARES:
+            p = board.piece_at(sq)
+            if p:
+                ch = piece_to_channel[p.piece_type]
+                if p.color == chess.BLACK:
+                    ch += 6
+                file = chess.square_file(sq)   # 0..7 (a..h)
+                rank = chess.square_rank(sq)   # 0..7 (1..8)
+                tensor[ch, rank, file] = 1.0
         
-        return torch.FloatTensor(tensor).unsqueeze(0).to(self.device)
+        return torch.from_numpy(tensor).unsqueeze(0).to(self.device)
     
+    def move_to_index(self, move):
+        """Compact encoding: from*64 + to (promotion not distinguished here)."""
+        return move.from_square * 64 + move.to_square
+    
+    def index_to_move(self, board, idx):
+        """Convert index back to legal move if possible.
+        This helper tries to map idx to a legal move in current board.
+        If multiple moves share the same from/to (rare except promotions), default to the first legal matching move.
+        """
+        from_sq = idx // 64
+        to_sq = idx % 64
+        # Try exact move object
+        candidate = chess.Move(from_sq, to_sq)
+        if candidate in board.legal_moves:
+            return candidate
+        # Try promotions if applicable
+        for promo_piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+            m = chess.Move(from_sq, to_sq, promotion=promo_piece)
+            if m in board.legal_moves:
+                return m
+        # Fallback: choose first legal move with same from/to pattern
+        for m in board.legal_moves:
+            if m.from_square == from_sq and m.to_square == to_sq:
+                return m
+        # If nothing matches return None
+        return None
+
+    # ---------------------------
+    # Policy inference
+    # ---------------------------
     def get_move_probabilities(self, board):
-        """Get move probabilities from the neural network"""
+        """Get move probabilities from the neural network (masked over legal moves)."""
         self.model.eval()
         with torch.no_grad():
             board_tensor = self.board_to_tensor(board)
-            policy, value = self.model(board_tensor)
+            policy_logits, value = self.model(board_tensor)
+            move_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
             
-            # Mask illegal moves
             legal_moves = list(board.legal_moves)
-            move_probs = torch.softmax(policy, dim=1).cpu().numpy()[0]
-            
-            # Convert moves to indices
             legal_move_probs = []
             for move in legal_moves:
-                from_sq = move.from_square
-                to_sq = move.to_square
-                move_idx = from_sq * 64 + to_sq
-                legal_move_probs.append((move, move_probs[move_idx]))
+                idx = self.move_to_index(move)
+                legal_move_probs.append((move, float(move_probs[idx])))
             
-            # Normalize probabilities
-            total_prob = sum(prob for _, prob in legal_move_probs)
+            total_prob = sum(p for _, p in legal_move_probs)
             if total_prob > 0:
-                legal_move_probs = [(move, prob/total_prob) for move, prob in legal_move_probs]
+                legal_move_probs = [(m, p/total_prob) for m, p in legal_move_probs]
             else:
-                # If all probs are zero, use uniform distribution
+                # uniform
                 prob = 1.0 / len(legal_moves)
-                legal_move_probs = [(move, prob) for move in legal_moves]
+                legal_move_probs = [(m, prob) for m in legal_moves]
             
-            return legal_move_probs, value.item()
+            return legal_move_probs, float(value.item())
     
     def select_move(self, board, temperature=1.0):
-        """Select a move using the neural network with exploration"""
+        """Select a move using the neural network with exploration."""
         move_probs, _ = self.get_move_probabilities(board)
         
         if temperature == 0:
             # Greedy selection
             return max(move_probs, key=lambda x: x[1])[0]
         
-        # Sample from probability distribution with temperature
         moves, probs = zip(*move_probs)
-        probs = np.array(probs) ** (1.0 / temperature)
+        probs = np.array(probs, dtype=np.float64) ** (1.0 / temperature)
         probs = probs / probs.sum()
-        
         return np.random.choice(moves, p=probs)
     
-    def play_game(self, temperature=1.0):
-        """Play a single self-play game"""
+    # ---------------------------
+    # Self-play and buffer
+    # ---------------------------
+    def play_game(self, temperature=1.0, max_moves=400):
+        """Play a single self-play game and return per-move training records."""
         board = chess.Board()
-        game_data = []
+        game_data = []  # stores tuples (board_tensor_cpu, move_idx, player)
         
         while not board.is_game_over() and not self.stop_training_flag:
-            # Store board state
-            board_tensor = self.board_to_tensor(board)
-            
-            # Select move
+            board_tensor = self.board_to_tensor(board).cpu()  # keep CPU copy in buffer
             move = self.select_move(board, temperature)
-            
-            # Store state and move for training
-            game_data.append({
-                'board': board_tensor.cpu(),
-                'move': move,
-                'player': board.turn
-            })
-            
+            move_idx = self.move_to_index(move)
+            player = board.turn
+            game_data.append((board_tensor, move_idx, player))
             board.push(move)
-            
-            # Limit game length to prevent infinite games
-            if len(game_data) > 200:
+            if len(game_data) > max_moves:
                 break
         
         # Determine game result
@@ -189,65 +232,114 @@ class ChessAI:
         
         return game_data, reward
     
-    def train_on_game(self, game_data, reward):
-        """Train the network on a completed game"""
-        if len(game_data) == 0:
-            return 0, 0
-            
+    def add_game_to_buffer(self, game_data, reward):
+        """Add each move from game_data to replay buffer with computed target values."""
+        for board_tensor_cpu, move_idx, player in game_data:
+            # target_value is reward from perspective of the player who made that move
+            target_value = reward if player == chess.WHITE else -reward
+            # Store tuple: (board_tensor_cpu, move_idx, target_value)
+            # board_tensor_cpu is a torch tensor on CPU shape (1,12,8,8)
+            self.replay_buffer.append((board_tensor_cpu, move_idx, target_value))
+    
+    # ---------------------------
+    # Training from buffer
+    # ---------------------------
+    def sample_batch(self):
+        """Sample a batch from the replay buffer. Returns lists."""
+        if len(self.replay_buffer) >= self.batch_size:
+            batch = random.sample(self.replay_buffer, self.batch_size)
+        else:
+            # If not enough samples, sample with replacement to fill batch
+            batch = [random.choice(self.replay_buffer) for _ in range(self.batch_size)]
+        boards, move_idxs, target_values = zip(*batch)
+        # Stack states into tensor (batch,12,8,8)
+        boards_tensor = torch.cat(boards, dim=0).to(self.device)  # boards were stored as (1,12,8,8)
+        move_idxs_tensor = torch.LongTensor(move_idxs).to(self.device)
+        target_values_tensor = torch.FloatTensor(target_values).to(self.device)
+        return boards_tensor, move_idxs_tensor, target_values_tensor
+    
+    def train_on_batch(self, boards_tensor, move_idxs_tensor, target_values_tensor):
+        """Train the network on a single minibatch with advantage normalization."""
         self.model.train()
         
-        total_policy_loss = 0
-        total_value_loss = 0
+        # Forward pass
+        policy_logits, values = self.model(boards_tensor)  # policy_logits: (B,4096)  values: (B,1)
+        values = values.view(-1)  # shape (B,)
         
-        for i, data in enumerate(game_data):
-            board_tensor = data['board'].to(self.device)
-            move = data['move']
-            player = data['player']
-            
-            # Adjust reward based on player
-            target_value = reward if player == chess.WHITE else -reward
-            
-            # Forward pass
-            policy, value = self.model(board_tensor)
-            
-            # Value loss
-            value_loss = (value - target_value) ** 2
-            
-            # Policy loss (encourage winning moves)
-            move_idx = move.from_square * 64 + move.to_square
-            policy_loss = -torch.log_softmax(policy, dim=1)[0, move_idx] * target_value
-            
-            # Combined loss
-            loss = policy_loss + value_loss
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
+        # Compute log probs for selected moves
+        log_probs = F.log_softmax(policy_logits, dim=1)  # (B, A)
+        selected_log_probs = log_probs[range(self.batch_size), move_idxs_tensor]  # (B,)
         
-        return total_policy_loss / len(game_data), total_value_loss / len(game_data)
+        # Compute raw advantages (target - value_estimate), but we detach value estimate for advantage
+        advantages = (target_values_tensor - values).detach()
+        # Normalize advantages (zero mean, unit var)
+        adv_mean = advantages.mean()
+        adv_std = advantages.std(unbiased=False)
+        if adv_std.item() < 1e-6:
+            advantages_norm = advantages - adv_mean
+        else:
+            advantages_norm = (advantages - adv_mean) / (adv_std + 1e-8)
+        
+        # Policy loss (negative log prob * advantage)
+        policy_loss = - (selected_log_probs * advantages_norm).mean()
+        
+        # Value loss (MSE)
+        value_loss = F.mse_loss(values, target_values_tensor)
+        
+        # Entropy bonus (to encourage exploration)
+        probs = F.softmax(policy_logits, dim=1)
+        entropy = - (probs * log_probs).sum(dim=1).mean()
+        
+        loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        # gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+        self.optimizer.step()
+        
+        return policy_loss.item(), value_loss.item()
     
+    # ---------------------------
+    # Top-level training loop
+    # ---------------------------
     def train(self, num_games=10, temperature=1.0, callback=None):
-        """Train the AI by self-play"""
+        """Train the AI by self-play using replay buffer + minibatches."""
         self.stop_training_flag = False
         
         for game_num in range(num_games):
             if self.stop_training_flag:
                 print("Training stopped by user")
                 break
-                
-            # Play a game
+            
+            # 1) Play a self-play game
             game_data, reward = self.play_game(temperature)
             
-            # Train on the game
-            policy_loss, value_loss = self.train_on_game(game_data, reward)
+            # 2) Add to replay buffer
+            self.add_game_to_buffer(game_data, reward)
+            
+            # 3) Run several training steps sampling from buffer if large enough
+            avg_policy_loss = 0.0
+            avg_value_loss = 0.0
+            steps_done = 0
+            if len(self.replay_buffer) >= max(self.min_buffer_size, self.batch_size):
+                for _ in range(self.train_steps_per_game):
+                    boards_tensor, move_idxs_tensor, target_values_tensor = self.sample_batch()
+                    p_loss, v_loss = self.train_on_batch(boards_tensor, move_idxs_tensor, target_values_tensor)
+                    avg_policy_loss += p_loss
+                    avg_value_loss += v_loss
+                    steps_done += 1
+                if steps_done > 0:
+                    avg_policy_loss /= steps_done
+                    avg_value_loss /= steps_done
+            else:
+                # Not enough data yet — skip training step, return zeros so UI knows
+                avg_policy_loss, avg_value_loss = 0.0, 0.0
             
             if callback:
-                callback(game_num + 1, num_games, policy_loss, value_loss, reward)
+                callback(game_num + 1, num_games, avg_policy_loss, avg_value_loss, reward)
             
-            # Save model periodically
+            # Save periodically
             if (game_num + 1) % 10 == 0:
                 self.save_model()
     
@@ -255,38 +347,39 @@ class ChessAI:
         """Stop the training process"""
         self.stop_training_flag = True
     
+    # ---------------------------
+    # Save / load (safer)
+    # ---------------------------
     def save_model(self):
-        """Save model and training stats"""
+        """Save model (CPU state dict) and training stats to make it portable."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save model weights
         model_path = os.path.join(self.save_dir, "model_latest.pth")
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'training_stats': self.training_stats
-        }, model_path)
-        
-        # Also save a timestamped backup every 50 games
-        if self.training_stats['games_played'] % 50 == 0:
-            backup_path = os.path.join(self.save_dir, f"model_{timestamp}.pth")
+        try:
+            cpu_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
             torch.save({
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
+                'model_state_dict': cpu_state,
                 'training_stats': self.training_stats
-            }, backup_path)
-        
-        print(f"Model saved to {model_path}")
+            }, model_path)
+            # Backup occasionally
+            if self.training_stats['games_played'] % 50 == 0:
+                backup_path = os.path.join(self.save_dir, f"model_{timestamp}.pth")
+                torch.save({
+                    'model_state_dict': cpu_state,
+                    'training_stats': self.training_stats
+                }, backup_path)
+            print(f"Model saved to {model_path}")
+        except Exception as e:
+            print(f"Error saving model: {e}")
     
     def load_model(self):
-        """Load model and training stats"""
+        """Load model and training stats (maps to device afterwards)."""
         model_path = os.path.join(self.save_dir, "model_latest.pth")
         if os.path.exists(model_path):
             try:
-                checkpoint = torch.load(model_path, map_location=self.device)
+                checkpoint = torch.load(model_path, map_location='cpu')
                 self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                self.training_stats = checkpoint['training_stats']
+                self.model.to(self.device)
+                self.training_stats = checkpoint.get('training_stats', self.training_stats)
                 print(f"Model loaded from {model_path}")
                 print(f"Training stats: {self.training_stats}")
             except Exception as e:
@@ -296,6 +389,9 @@ class ChessAI:
             print("No saved model found. Starting fresh.")
 
 
+# ---------------------------
+# GUI class (unchanged except calling new ai.train)
+# ---------------------------
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
