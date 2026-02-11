@@ -3,17 +3,21 @@ Chess AI with Self-Play Reinforcement Learning
 IMPROVED VERSION with enhanced GUI and user experience
 Windows-compatible version - no cairosvg required!
 
-Upgrades in this file:
-- Replay buffer + minibatch training
-- Advantage normalization (per-batch)
-- Entropy regularization + gradient clipping (small helpers)
-- Slightly safer save/load (model on CPU)
-- Clearer board_to_tensor indexing (chess.square_file/square_rank)
+This file contains stability fixes and training improvements to avoid exploding/NaN
+loss values and make training behave reasonably on a single-machine/home GPU.
 
-Added features in this edited version:
-- Board flip toggle (auto-flips when you choose to play as Black)
-- Promotion dialog when a pawn reaches the last rank (choose Q/R/B/N)
+Key fixes and improvements:
+- Safer policy loss indexing using torch.gather (avoids silent indexing bugs).
+- Clip normalized advantages to a reasonable range to avoid huge policy gradients.
+- Reduced default learning rate and added small weight decay to stabilize training.
+- Detect and skip optimizer step on NaN/Inf loss and print diagnostics.
+- Defensive checks: skip storing moves with None index.
+- Slightly smaller entropy coefficient default for stability.
+
+These changes should stop "policy loss = -millions" issues and make training
+stable enough to iterate further.
 """
+
 import chess
 import torch
 import torch.nn as nn
@@ -23,6 +27,7 @@ import numpy as np
 import random
 import pickle
 import os
+import math
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -52,6 +57,13 @@ class ChessNet(nn.Module):
         
         self.dropout = nn.Dropout(0.3)
         
+        # Initialize weights (small randomization helps stability)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
     def forward(self, x):
         # Convolutional layers
         x = torch.relu(self.conv1(x))
@@ -76,10 +88,12 @@ class ChessNet(nn.Module):
 class ChessAI:
     def __init__(self, save_dir="chess_ai_models",
                  replay_capacity=20000, batch_size=128, train_steps_per_game=4,
-                 entropy_coef=0.01, value_coef=1.0, clip_grad=1.0, min_buffer_size=512):
+                 entropy_coef=0.005, value_coef=1.0, clip_grad=1.0, min_buffer_size=512,
+                 lr=1e-4, weight_decay=1e-5):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        # Reduced learning rate and small weight decay for stability
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.save_dir = save_dir
         self.training_stats = {
             'games_played': 0,
@@ -212,6 +226,9 @@ class ChessAI:
         while not board.is_game_over() and not self.stop_training_flag:
             board_tensor = self.board_to_tensor(board).cpu()  # keep CPU copy in buffer
             move = self.select_move(board, temperature)
+            # safety: if select_move somehow returns None, break
+            if move is None:
+                break
             move_idx = self.move_to_index(move)
             player = board.turn
             game_data.append((board_tensor, move_idx, player))
@@ -237,8 +254,12 @@ class ChessAI:
         return game_data, reward
     
     def add_game_to_buffer(self, game_data, reward):
-        """Add each move from game_data to replay buffer with computed target values."""
+        """Add each move from game_data to replay buffer with computed target values.
+        Defensive: skip moves with None indexes.
+        """
         for board_tensor_cpu, move_idx, player in game_data:
+            if move_idx is None:
+                continue
             # target_value is reward from perspective of the player who made that move
             target_value = reward if player == chess.WHITE else -reward
             # Store tuple: (board_tensor_cpu, move_idx, target_value)
@@ -263,16 +284,18 @@ class ChessAI:
         return boards_tensor, move_idxs_tensor, target_values_tensor
     
     def train_on_batch(self, boards_tensor, move_idxs_tensor, target_values_tensor):
-        """Train the network on a single minibatch with advantage normalization."""
+        """Train the network on a single minibatch with advantage normalization.
+        Stabilization measures included here to avoid exploding losses.
+        """
         self.model.train()
         
         # Forward pass
         policy_logits, values = self.model(boards_tensor)  # policy_logits: (B,4096)  values: (B,1)
         values = values.view(-1)  # shape (B,)
         
-        # Compute log probs for selected moves
+        # Compute log probs for selected moves using gather (safer indexing)
         log_probs = F.log_softmax(policy_logits, dim=1)  # (B, A)
-        selected_log_probs = log_probs[range(self.batch_size), move_idxs_tensor]  # (B,)
+        selected_log_probs = log_probs.gather(1, move_idxs_tensor.unsqueeze(1)).squeeze(1)  # (B,)
         
         # Compute raw advantages (target - value_estimate), but we detach value estimate for advantage
         advantages = (target_values_tensor - values).detach()
@@ -283,6 +306,8 @@ class ChessAI:
             advantages_norm = advantages - adv_mean
         else:
             advantages_norm = (advantages - adv_mean) / (adv_std + 1e-8)
+        # Clip advantages to avoid extreme updates
+        advantages_norm = torch.clamp(advantages_norm, -10.0, 10.0)
         
         # Policy loss (negative log prob * advantage)
         policy_loss = - (selected_log_probs * advantages_norm).mean()
@@ -295,6 +320,20 @@ class ChessAI:
         entropy = - (probs * log_probs).sum(dim=1).mean()
         
         loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+        
+        # Safety: check for NaN/Inf before stepping
+        if not torch.isfinite(loss):
+            # Print diagnostics to help debugging and skip this update
+            try:
+                print("*** Non-finite loss encountered - skipping optimizer step ***")
+                print("Policy loss:", policy_loss.item())
+                print("Value loss:", value_loss.item())
+                print("Entropy:", entropy.item())
+                print("Selected log probs stats: min", selected_log_probs.min().item(), "max", selected_log_probs.max().item())
+                print("Advantages stats: mean", advantages_norm.mean().item(), "std", advantages_norm.std().item())
+            except Exception:
+                pass
+            return float('nan'), float('nan')
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -330,6 +369,9 @@ class ChessAI:
                 for _ in range(self.train_steps_per_game):
                     boards_tensor, move_idxs_tensor, target_values_tensor = self.sample_batch()
                     p_loss, v_loss = self.train_on_batch(boards_tensor, move_idxs_tensor, target_values_tensor)
+                    # handle NaN returns
+                    if p_loss != p_loss or v_loss != v_loss:  # NaN check
+                        continue
                     avg_policy_loss += p_loss
                     avg_value_loss += v_loss
                     steps_done += 1
@@ -806,6 +848,8 @@ Model Location:
         
         try:
             move = self.ai.select_move(self.board, temperature=0.1)
+            if move is None:
+                return
             san_move = self.board.san(move)
             self.make_move(move)
             
@@ -866,6 +910,8 @@ Model Location:
         if not self.board.is_game_over():
             try:
                 move = self.ai.select_move(self.board, temperature=0.1)
+                if move is None:
+                    return
                 san_move = self.board.san(move)
                 self.make_move(move)
                 self.update_board_display()
@@ -1034,6 +1080,5 @@ Model Location:
 
 
 if __name__ == "__main__":
-
     gui = ChessGUI()
     gui.run()
