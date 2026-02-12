@@ -1,6 +1,7 @@
 """
 Chess AI with Self-Play Reinforcement Learning
 IMPROVED VERSION with FIXED policy loss stability AND threefold repetition draw
+PLUS: Draw penalty to discourage excessive draws
 
 Key fixes for policy loss explosion:
 1. Clip log probabilities to prevent extreme negative values
@@ -9,7 +10,8 @@ Key fixes for policy loss explosion:
 4. Better replay buffer management with maximum age
 5. Adaptive entropy coefficient
 6. Enhanced diagnostics and loss monitoring
-7. **NEW: Automatic draw on threefold repetition**
+7. Automatic draw on threefold repetition
+8. NEW: Draw penalty (-0.1 by default) to encourage winning play
 """
 
 import chess
@@ -53,8 +55,10 @@ class ChessNet(nn.Module):
         # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
+                # If weight doesn't have shape (like Dropout), skip init
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if hasattr(m, "bias") and m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
@@ -89,7 +93,8 @@ class ChessAI:
                  min_buffer_size=1500,
                  lr=1e-4, 
                  weight_decay=1e-5,
-                 max_data_age=4000):
+                 max_data_age=4000,
+                 draw_penalty=-0.1):  # NEW: Configurable draw penalty
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
@@ -116,11 +121,12 @@ class ChessAI:
         self.clip_grad = clip_grad
         self.min_buffer_size = min_buffer_size
         self.max_data_age = max_data_age
+        self.draw_penalty = draw_penalty  # NEW: Store draw penalty
         
-        # NEW: Track data age for each entry
+        # Track data age for each entry
         self.data_counter = 0
         
-        # NEW: Loss history for monitoring
+        # Loss history for monitoring
         self.loss_history = deque(maxlen=100)
         
         os.makedirs(save_dir, exist_ok=True)
@@ -143,9 +149,11 @@ class ChessAI:
                     ch += 6
                 file = chess.square_file(sq)
                 rank = chess.square_rank(sq)
+                # rank and file go 0..7
                 tensor[ch, rank, file] = 1.0
         
-        return torch.from_numpy(tensor).unsqueeze(0).to(self.device)
+        # Return a torch tensor with batch dim (1,12,8,8) on CPU by default
+        return torch.from_numpy(tensor).unsqueeze(0)
     
     def move_to_index(self, move):
         """Compact encoding: from*64 + to"""
@@ -175,7 +183,7 @@ class ChessAI:
         """Get move probabilities from the neural network."""
         self.model.eval()
         with torch.no_grad():
-            board_tensor = self.board_to_tensor(board)
+            board_tensor = self.board_to_tensor(board).to(self.device)
             policy_logits, value = self.model(board_tensor)
             move_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
             
@@ -183,7 +191,11 @@ class ChessAI:
             legal_move_probs = []
             for move in legal_moves:
                 idx = self.move_to_index(move)
-                legal_move_probs.append((move, float(move_probs[idx])))
+                # guard: idx might be out of range (shouldn't be with standard Move), but keep safe
+                if idx < len(move_probs):
+                    legal_move_probs.append((move, float(move_probs[idx])))
+                else:
+                    legal_move_probs.append((move, 0.0))
             
             total_prob = sum(p for _, p in legal_move_probs)
             if total_prob > 0:
@@ -202,7 +214,10 @@ class ChessAI:
             return max(move_probs, key=lambda x: x[1])[0]
         
         moves, probs = zip(*move_probs)
-        probs = np.array(probs, dtype=np.float64) ** (1.0 / temperature)
+        probs = np.array(probs, dtype=np.float64)
+        # numerical safety
+        probs = np.clip(probs, 1e-12, None)
+        probs = probs ** (1.0 / max(1e-8, temperature))
         probs = probs / probs.sum()
         return np.random.choice(moves, p=probs)
     
@@ -210,14 +225,17 @@ class ChessAI:
         """Play a single self-play game and return per-move training records."""
         board = chess.Board()
         game_data = []
+        is_threefold = False
         
         while not board.is_game_over() and not self.stop_training_flag:
-            # **NEW: Check for threefold repetition and end game as draw**
+            # Check for threefold repetition and end game as draw
             if board.can_claim_threefold_repetition():
-                print(f"Draw by threefold repetition detected at move {len(game_data)}")
+                # note: claimable threefold repetition may be present before making a move
+                is_threefold = True
+                print(f"Draw by threefold repetition detected at ply {len(game_data)}")
                 break
             
-            board_tensor = self.board_to_tensor(board).cpu()
+            board_tensor = self.board_to_tensor(board).cpu()  # keep stored tensors on CPU to save GPU RAM
             move = self.select_move(board, temperature)
             
             if move is None:
@@ -226,43 +244,66 @@ class ChessAI:
             move_idx = self.move_to_index(move)
             player = board.turn
             
-            # NEW: Store current policy probability for importance sampling
+            # Store current policy probability for importance sampling
             with torch.no_grad():
                 self.model.eval()
                 board_tensor_device = board_tensor.to(self.device)
                 policy_logits, _ = self.model(board_tensor_device)
                 log_probs = F.log_softmax(policy_logits, dim=1)
-                move_log_prob = log_probs[0, move_idx].item()
+                # if move_idx out of range for safety, set a large negative prob
+                if move_idx < log_probs.shape[1]:
+                    move_log_prob = log_probs[0, move_idx].item()
+                else:
+                    move_log_prob = -10.0
             
             game_data.append((board_tensor, move_idx, player, move_log_prob))
             board.push(move)
             
             if len(game_data) > max_moves:
+                # treat long games hitting max_moves as draw-ish (you can change policy)
                 break
         
-        result = board.result()
-        if result == "1-0":
-            reward = 1.0
-            self.training_stats['white_wins'] += 1
-        elif result == "0-1":
-            reward = -1.0
-            self.training_stats['black_wins'] += 1
-        else:
-            reward = 0.0  # Draw
+        # *** UPDATED: Assign rewards with draw penalty ***
+        reward = None
+        if is_threefold:
+            reward = self.draw_penalty
             self.training_stats['draws'] += 1
+        else:
+            result = board.result()
+            if result == "1-0":
+                reward = 1.0
+                self.training_stats['white_wins'] += 1
+            elif result == "0-1":
+                reward = -1.0
+                self.training_stats['black_wins'] += 1
+            elif result == "1/2-1/2":
+                reward = self.draw_penalty
+                self.training_stats['draws'] += 1
+            else:
+                # '*' or unexpected: treat conservatively as draw (can be adjusted)
+                reward = self.draw_penalty
+                self.training_stats['draws'] += 1
         
         self.training_stats['games_played'] += 1
         self.training_stats['total_moves'] += len(game_data)
         
-        return game_data, reward
+        return game_data, reward, is_threefold
     
-    def add_game_to_buffer(self, game_data, reward):
-        """Add each move from game_data to replay buffer with age tracking."""
+    def add_game_to_buffer(self, game_data, reward, is_draw=False):
+        """Add each move from game_data to replay buffer with age tracking.
+        
+        Accept explicit is_draw flag so draw handling doesn't rely on reward equality.
+        """
         for board_tensor_cpu, move_idx, player, old_log_prob in game_data:
             if move_idx is None:
                 continue
             
-            target_value = reward if player == chess.WHITE else -reward
+            if is_draw:
+                # Both players get the same penalty/value for draws
+                target_value = self.draw_penalty
+            else:
+                # Win/loss: White sees actual reward, Black sees flipped
+                target_value = reward if player == chess.WHITE else -reward
             
             # Store with age counter for data freshness tracking
             self.replay_buffer.append((
@@ -292,13 +333,18 @@ class ChessAI:
     
     def sample_batch(self):
         """Sample a batch from the replay buffer."""
+        if len(self.replay_buffer) == 0:
+            raise ValueError("Replay buffer is empty - cannot sample batch")
+        
         if len(self.replay_buffer) >= self.batch_size:
             batch = random.sample(self.replay_buffer, self.batch_size)
         else:
+            # if buffer smaller than batch_size, sample with replacement
             batch = [random.choice(self.replay_buffer) for _ in range(self.batch_size)]
         
         boards, move_idxs, target_values, old_log_probs, _ = zip(*batch)
         
+        # boards are stored as tensors with shape (1,12,8,8) on CPU
         boards_tensor = torch.cat(boards, dim=0).to(self.device)
         move_idxs_tensor = torch.LongTensor(move_idxs).to(self.device)
         target_values_tensor = torch.FloatTensor(target_values).to(self.device)
@@ -362,11 +408,14 @@ class ChessAI:
         # Safety check for non-finite loss
         if not torch.isfinite(loss):
             print("*** Non-finite loss detected - skipping update ***")
-            print(f"Policy loss: {policy_loss_raw.item():.4f} (clamped to {policy_loss.item():.4f})")
-            print(f"Value loss: {value_loss.item():.4f}")
-            print(f"Entropy: {entropy.item():.4f}")
-            print(f"Log prob range: [{selected_log_probs.min().item():.4f}, {selected_log_probs.max().item():.4f}]")
-            print(f"Ratio range: [{ratio.min().item():.4f}, {ratio.max().item():.4f}]")
+            try:
+                print(f"Policy loss: {policy_loss_raw.item():.4f} (clamped to {policy_loss.item():.4f})")
+                print(f"Value loss: {value_loss.item():.4f}")
+                print(f"Entropy: {entropy.item():.4f}")
+                print(f"Log prob range: [{selected_log_probs.min().item():.4f}, {selected_log_probs.max().item():.4f}]")
+                print(f"Ratio range: [{ratio.min().item():.4f}, {ratio.max().item():.4f}]")
+            except Exception:
+                pass
             return float('nan'), float('nan')
         
         # Backward pass
@@ -378,8 +427,12 @@ class ChessAI:
         
         self.optimizer.step()
         
-        # Track loss history
-        self.loss_history.append(policy_loss.item())
+        # Track loss history (use policy_loss numeric)
+        try:
+            self.loss_history.append(policy_loss.item())
+        except Exception:
+            # fallback default numeric
+            self.loss_history.append(0.0)
         
         # Diagnostic: warn if policy loss magnitude is growing
         if len(self.loss_history) >= 50:
@@ -401,10 +454,11 @@ class ChessAI:
                 break
             
             # Play a self-play game
-            game_data, reward = self.play_game(temperature)
+            game_data, reward, is_threefold = self.play_game(temperature)
             
-            # Add to replay buffer
-            self.add_game_to_buffer(game_data, reward)
+            # Add to replay buffer, pass explicit draw flag
+            is_draw = bool(is_threefold or abs(reward - self.draw_penalty) < 1e-6)
+            self.add_game_to_buffer(game_data, reward, is_draw=is_draw)
             
             # Clean old data periodically
             if game_num % 10 == 0:
@@ -417,7 +471,11 @@ class ChessAI:
             
             if len(self.replay_buffer) >= max(self.min_buffer_size, self.batch_size):
                 for _ in range(self.train_steps_per_game):
-                    boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor = self.sample_batch()
+                    try:
+                        boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor = self.sample_batch()
+                    except ValueError:
+                        break  # can't sample yet
+                    
                     p_loss, v_loss = self.train_on_batch(boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor)
                     
                     if p_loss != p_loss or v_loss != v_loss:  # NaN check
@@ -473,6 +531,7 @@ class ChessAI:
         if os.path.exists(model_path):
             try:
                 checkpoint = torch.load(model_path, map_location='cpu')
+                # ensure keys match - object saved as cpu tensors
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.model.to(self.device)
                 self.training_stats = checkpoint.get('training_stats', self.training_stats)
@@ -490,11 +549,11 @@ class ChessAI:
             print("No saved model found. Starting fresh.")
 
 
-# GUI class remains mostly the same
+# GUI class remains mostly the same but with corrected draw-labeling in the callback
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - Self-Play RL (FIXED + Threefold Repetition)")
+        self.window.title("Chess AI - Self-Play RL (FIXED + Draw Penalty)")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -592,7 +651,7 @@ class ChessGUI:
         ttk.Label(stats_frame, text=device_info, foreground="blue").grid(row=1, column=0, pady=5)
         
         # Status bar
-        self.status_var = tk.StringVar(value="Ready - With threefold repetition draw detection")
+        self.status_var = tk.StringVar(value=f"Ready - Draw penalty: {self.ai.draw_penalty}")
         status_label = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_label.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
@@ -729,6 +788,7 @@ White Wins: {stats['white_wins']} ({win_rate_white:.1f}%)
 Black Wins: {stats['black_wins']} ({win_rate_black:.1f}%)
 Draws: {stats['draws']} ({draw_rate:.1f}%)
 
+Draw Penalty: {self.ai.draw_penalty}
 Model: {self.ai.save_dir}
         """.strip()
         
@@ -1000,8 +1060,12 @@ Model: {self.ai.save_dir}
             self.window.after(100, self.process_queue)
     
     def training_callback(self, game_num, total_games, policy_loss, value_loss, reward):
-        result = "Win" if reward > 0 else ("Loss" if reward < 0 else "Draw")
-        text = f"Game {game_num}/{total_games}\n{result} (R: {reward:.2f})\nP-Loss: {policy_loss:.4f}\nV-Loss: {value_loss:.4f}"
+        # Correctly detect draw even if draw_penalty is negative
+        if abs(reward - self.ai.draw_penalty) < 1e-6:
+            result_str = "Draw"
+        else:
+            result_str = "Win" if reward > 0 else "Loss"
+        text = f"Game {game_num}/{total_games}\n{result_str} (R: {reward:.2f})\nP-Loss: {policy_loss:.4f}\nV-Loss: {value_loss:.4f}"
         
         self.message_queue.put({
             'type': 'training_update',
