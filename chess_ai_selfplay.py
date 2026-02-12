@@ -206,7 +206,7 @@ class ChessAI:
         probs = probs / probs.sum()
         return np.random.choice(moves, p=probs)
     
-    def play_game(self, temperature=1.0, max_moves=100):
+    def play_game(self, temperature=1.0, max_moves=120):
         """Play a single self-play game and return per-move training records."""
         board = chess.Board()
         game_data = []
