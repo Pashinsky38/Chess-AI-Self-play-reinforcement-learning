@@ -80,16 +80,16 @@ class ChessNet(nn.Module):
 
 class ChessAI:
     def __init__(self, save_dir="chess_ai_models",
-                 replay_capacity=10000,  # Reduced from 20000
+                 replay_capacity=30000,
                  batch_size=128, 
-                 train_steps_per_game=4,
-                 entropy_coef=0.01,  # Slightly increased
-                 value_coef=1.0, 
+                 train_steps_per_game=16,
+                 entropy_coef=0.02,
+                 value_coef=1.5, 
                  clip_grad=1.0, 
-                 min_buffer_size=512,
+                 min_buffer_size=1500,
                  lr=1e-4, 
                  weight_decay=1e-5,
-                 max_data_age=2000):  # NEW: max age of data in replay buffer
+                 max_data_age=4000):
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
@@ -553,7 +553,7 @@ class ChessGUI:
         num_games_entry.grid(row=0, column=1, pady=5, padx=5)
         
         ttk.Label(train_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.temperature_var = tk.StringVar(value="1.3")
+        self.temperature_var = tk.StringVar(value="1.0")
         temp_entry = ttk.Entry(train_frame, textvariable=self.temperature_var, width=15)
         temp_entry.grid(row=1, column=1, pady=5, padx=5)
         
