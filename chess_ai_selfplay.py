@@ -205,7 +205,7 @@ class ChessAI:
         probs = probs / probs.sum()
         return np.random.choice(moves, p=probs)
     
-    def play_game(self, temperature=1.0, max_moves=120):
+    def play_game(self, temperature=1.0, max_moves=100):
         """Play a single self-play game and return per-move training records."""
         board = chess.Board()
         game_data = []
@@ -242,7 +242,7 @@ class ChessAI:
             reward = -1.0
             self.training_stats['black_wins'] += 1
         else:
-            reward = -0.3  # Penalize draws to encourage decisive play
+            reward = 0 # Draw
             self.training_stats['draws'] += 1
         
         self.training_stats['games_played'] += 1
