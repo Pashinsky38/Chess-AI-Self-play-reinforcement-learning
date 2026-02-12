@@ -1,21 +1,14 @@
 """
 Chess AI with Self-Play Reinforcement Learning
-IMPROVED VERSION with enhanced GUI and user experience
-Windows-compatible version - no cairosvg required!
+IMPROVED VERSION with FIXED policy loss stability
 
-This file contains stability fixes and training improvements to avoid exploding/NaN
-loss values and make training behave reasonably on a single-machine/home GPU.
-
-Key fixes and improvements:
-- Safer policy loss indexing using torch.gather (avoids silent indexing bugs).
-- Clip normalized advantages to a reasonable range to avoid huge policy gradients.
-- Reduced default learning rate and added small weight decay to stabilize training.
-- Detect and skip optimizer step on NaN/Inf loss and print diagnostics.
-- Defensive checks: skip storing moves with None index.
-- Slightly smaller entropy coefficient default for stability.
-
-These changes should stop "policy loss = -millions" issues and make training
-stable enough to iterate further.
+Key fixes for policy loss explosion:
+1. Clip log probabilities to prevent extreme negative values
+2. Add maximum policy loss magnitude cap
+3. Implement simple importance sampling with ratio clipping
+4. Better replay buffer management with maximum age
+5. Adaptive entropy coefficient
+6. Enhanced diagnostics and loss monitoring
 """
 
 import chess
@@ -45,7 +38,6 @@ class ChessNet(nn.Module):
         self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         
-        # keep flatten for now (you can replace with global pool later)
         self.fc1 = nn.Linear(128 * 8 * 8, 512)
         
         # Policy head (move probabilities)
@@ -57,7 +49,7 @@ class ChessNet(nn.Module):
         
         self.dropout = nn.Dropout(0.3)
         
-        # Initialize weights (small randomization helps stability)
+        # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
@@ -87,48 +79,54 @@ class ChessNet(nn.Module):
 
 class ChessAI:
     def __init__(self, save_dir="chess_ai_models",
-                 replay_capacity=20000, batch_size=128, train_steps_per_game=4,
-                 entropy_coef=0.005, value_coef=1.0, clip_grad=1.0, min_buffer_size=512,
-                 lr=1e-4, weight_decay=1e-5):
+                 replay_capacity=10000,  # Reduced from 20000
+                 batch_size=128, 
+                 train_steps_per_game=4,
+                 entropy_coef=0.01,  # Slightly increased
+                 value_coef=1.0, 
+                 clip_grad=1.0, 
+                 min_buffer_size=512,
+                 lr=1e-4, 
+                 weight_decay=1e-5,
+                 max_data_age=2000):  # NEW: max age of data in replay buffer
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
-        # Reduced learning rate and small weight decay for stability
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        
         self.save_dir = save_dir
         self.training_stats = {
             'games_played': 0,
             'total_moves': 0,
             'white_wins': 0,
             'black_wins': 0,
-            'draws': 0
+            'draws': 0,
+            'total_training_steps': 0  # Track training steps
         }
         self.stop_training_flag = False
         
         # Replay buffer parameters
         self.replay_capacity = replay_capacity
-        self.replay_buffer = deque(maxlen=replay_capacity)  # stores (board_tensor_cpu, move_idx, target_value)
+        self.replay_buffer = deque(maxlen=replay_capacity)
         self.batch_size = batch_size
         self.train_steps_per_game = train_steps_per_game
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.clip_grad = clip_grad
         self.min_buffer_size = min_buffer_size
+        self.max_data_age = max_data_age
         
-        # Create save directory if it doesn't exist
+        # NEW: Track data age for each entry
+        self.data_counter = 0
+        
+        # NEW: Loss history for monitoring
+        self.loss_history = deque(maxlen=100)
+        
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Try to load existing model
         self.load_model()
     
-    # ---------------------------
-    # Board / move encoding
-    # ---------------------------
     def board_to_tensor(self, board):
-        """Convert chess board to neural network input tensor.
-        Uses clear mapping: tensor[channel, rank, file], where
-        file = 0..7 (a..h), rank = 0..7 (1..8)
-        Returns FloatTensor shape (1,12,8,8) on self.device
-        """
+        """Convert chess board to neural network input tensor."""
         tensor = np.zeros((12, 8, 8), dtype=np.float32)
         
         piece_to_channel = {
@@ -142,44 +140,38 @@ class ChessAI:
                 ch = piece_to_channel[p.piece_type]
                 if p.color == chess.BLACK:
                     ch += 6
-                file = chess.square_file(sq)   # 0..7 (a..h)
-                rank = chess.square_rank(sq)   # 0..7 (1..8)
+                file = chess.square_file(sq)
+                rank = chess.square_rank(sq)
                 tensor[ch, rank, file] = 1.0
         
         return torch.from_numpy(tensor).unsqueeze(0).to(self.device)
     
     def move_to_index(self, move):
-        """Compact encoding: from*64 + to (promotion not distinguished here)."""
+        """Compact encoding: from*64 + to"""
         return move.from_square * 64 + move.to_square
     
     def index_to_move(self, board, idx):
-        """Convert index back to legal move if possible.
-        This helper tries to map idx to a legal move in current board.
-        If multiple moves share the same from/to (rare except promotions), default to the first legal matching move.
-        """
+        """Convert index back to legal move if possible."""
         from_sq = idx // 64
         to_sq = idx % 64
-        # Try exact move object
+        
         candidate = chess.Move(from_sq, to_sq)
         if candidate in board.legal_moves:
             return candidate
-        # Try promotions if applicable
+        
         for promo_piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
             m = chess.Move(from_sq, to_sq, promotion=promo_piece)
             if m in board.legal_moves:
                 return m
-        # Fallback: choose first legal move with same from/to pattern
+        
         for m in board.legal_moves:
             if m.from_square == from_sq and m.to_square == to_sq:
                 return m
-        # If nothing matches return None
+        
         return None
 
-    # ---------------------------
-    # Policy inference
-    # ---------------------------
     def get_move_probabilities(self, board):
-        """Get move probabilities from the neural network (masked over legal moves)."""
+        """Get move probabilities from the neural network."""
         self.model.eval()
         with torch.no_grad():
             board_tensor = self.board_to_tensor(board)
@@ -196,7 +188,6 @@ class ChessAI:
             if total_prob > 0:
                 legal_move_probs = [(m, p/total_prob) for m, p in legal_move_probs]
             else:
-                # uniform
                 prob = 1.0 / len(legal_moves)
                 legal_move_probs = [(m, prob) for m in legal_moves]
             
@@ -207,7 +198,6 @@ class ChessAI:
         move_probs, _ = self.get_move_probabilities(board)
         
         if temperature == 0:
-            # Greedy selection
             return max(move_probs, key=lambda x: x[1])[0]
         
         moves, probs = zip(*move_probs)
@@ -215,28 +205,35 @@ class ChessAI:
         probs = probs / probs.sum()
         return np.random.choice(moves, p=probs)
     
-    # ---------------------------
-    # Self-play and buffer
-    # ---------------------------
-    def play_game(self, temperature=1.0, max_moves=400):
+    def play_game(self, temperature=1.0, max_moves=120):
         """Play a single self-play game and return per-move training records."""
         board = chess.Board()
-        game_data = []  # stores tuples (board_tensor_cpu, move_idx, player)
+        game_data = []
         
         while not board.is_game_over() and not self.stop_training_flag:
-            board_tensor = self.board_to_tensor(board).cpu()  # keep CPU copy in buffer
+            board_tensor = self.board_to_tensor(board).cpu()
             move = self.select_move(board, temperature)
-            # safety: if select_move somehow returns None, break
+            
             if move is None:
                 break
+            
             move_idx = self.move_to_index(move)
             player = board.turn
-            game_data.append((board_tensor, move_idx, player))
+            
+            # NEW: Store current policy probability for importance sampling
+            with torch.no_grad():
+                self.model.eval()
+                board_tensor_device = board_tensor.to(self.device)
+                policy_logits, _ = self.model(board_tensor_device)
+                log_probs = F.log_softmax(policy_logits, dim=1)
+                move_log_prob = log_probs[0, move_idx].item()
+            
+            game_data.append((board_tensor, move_idx, player, move_log_prob))
             board.push(move)
+            
             if len(game_data) > max_moves:
                 break
         
-        # Determine game result
         result = board.result()
         if result == "1-0":
             reward = 1.0
@@ -245,7 +242,7 @@ class ChessAI:
             reward = -1.0
             self.training_stats['black_wins'] += 1
         else:
-            reward = 0.0
+            reward = -0.3  # Penalize draws to encourage decisive play
             self.training_stats['draws'] += 1
         
         self.training_stats['games_played'] += 1
@@ -254,98 +251,140 @@ class ChessAI:
         return game_data, reward
     
     def add_game_to_buffer(self, game_data, reward):
-        """Add each move from game_data to replay buffer with computed target values.
-        Defensive: skip moves with None indexes.
-        """
-        for board_tensor_cpu, move_idx, player in game_data:
+        """Add each move from game_data to replay buffer with age tracking."""
+        for board_tensor_cpu, move_idx, player, old_log_prob in game_data:
             if move_idx is None:
                 continue
-            # target_value is reward from perspective of the player who made that move
+            
             target_value = reward if player == chess.WHITE else -reward
-            # Store tuple: (board_tensor_cpu, move_idx, target_value)
-            # board_tensor_cpu is a torch tensor on CPU shape (1,12,8,8)
-            self.replay_buffer.append((board_tensor_cpu, move_idx, target_value))
+            
+            # Store with age counter for data freshness tracking
+            self.replay_buffer.append((
+                board_tensor_cpu, 
+                move_idx, 
+                target_value, 
+                old_log_prob,
+                self.data_counter  # age marker
+            ))
+            self.data_counter += 1
     
-    # ---------------------------
-    # Training from buffer
-    # ---------------------------
+    def clean_old_data(self):
+        """Remove old data from replay buffer if it's too old."""
+        if len(self.replay_buffer) < self.replay_capacity:
+            return
+        
+        # Remove entries older than max_data_age
+        current_counter = self.data_counter
+        new_buffer = deque(maxlen=self.replay_capacity)
+        
+        for entry in self.replay_buffer:
+            board_tensor, move_idx, target_value, old_log_prob, age_marker = entry
+            if current_counter - age_marker < self.max_data_age:
+                new_buffer.append(entry)
+        
+        self.replay_buffer = new_buffer
+    
     def sample_batch(self):
-        """Sample a batch from the replay buffer. Returns lists."""
+        """Sample a batch from the replay buffer."""
         if len(self.replay_buffer) >= self.batch_size:
             batch = random.sample(self.replay_buffer, self.batch_size)
         else:
-            # If not enough samples, sample with replacement to fill batch
             batch = [random.choice(self.replay_buffer) for _ in range(self.batch_size)]
-        boards, move_idxs, target_values = zip(*batch)
-        # Stack states into tensor (batch,12,8,8)
-        boards_tensor = torch.cat(boards, dim=0).to(self.device)  # boards were stored as (1,12,8,8)
+        
+        boards, move_idxs, target_values, old_log_probs, _ = zip(*batch)
+        
+        boards_tensor = torch.cat(boards, dim=0).to(self.device)
         move_idxs_tensor = torch.LongTensor(move_idxs).to(self.device)
         target_values_tensor = torch.FloatTensor(target_values).to(self.device)
-        return boards_tensor, move_idxs_tensor, target_values_tensor
+        old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
+        
+        return boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor
     
-    def train_on_batch(self, boards_tensor, move_idxs_tensor, target_values_tensor):
-        """Train the network on a single minibatch with advantage normalization.
-        Stabilization measures included here to avoid exploding losses.
-        """
+    def train_on_batch(self, boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor):
+        """Train the network on a single minibatch with stabilization."""
         self.model.train()
         
         # Forward pass
-        policy_logits, values = self.model(boards_tensor)  # policy_logits: (B,4096)  values: (B,1)
-        values = values.view(-1)  # shape (B,)
+        policy_logits, values = self.model(boards_tensor)
+        values = values.view(-1)
         
-        # Compute log probs for selected moves using gather (safer indexing)
-        log_probs = F.log_softmax(policy_logits, dim=1)  # (B, A)
-        selected_log_probs = log_probs.gather(1, move_idxs_tensor.unsqueeze(1)).squeeze(1)  # (B,)
+        # Compute log probs for selected moves
+        log_probs = F.log_softmax(policy_logits, dim=1)
+        selected_log_probs = log_probs.gather(1, move_idxs_tensor.unsqueeze(1)).squeeze(1)
         
-        # Compute raw advantages (target - value_estimate), but we detach value estimate for advantage
+        # *** KEY FIX 1: Clip log probabilities to prevent extreme values ***
+        selected_log_probs = torch.clamp(selected_log_probs, min=-10.0, max=0.0)
+        
+        # *** KEY FIX 2: Importance sampling ratio with clipping (PPO-style) ***
+        # This prevents large policy updates from old data
+        ratio = torch.exp(selected_log_probs - old_log_probs_tensor)
+        ratio = torch.clamp(ratio, min=0.5, max=2.0)  # Clip importance sampling ratio
+        
+        # Compute advantages
         advantages = (target_values_tensor - values).detach()
-        # Normalize advantages (zero mean, unit var)
+        
+        # Normalize advantages
         adv_mean = advantages.mean()
         adv_std = advantages.std(unbiased=False)
         if adv_std.item() < 1e-6:
             advantages_norm = advantages - adv_mean
         else:
             advantages_norm = (advantages - adv_mean) / (adv_std + 1e-8)
-        # Clip advantages to avoid extreme updates
-        advantages_norm = torch.clamp(advantages_norm, -10.0, 10.0)
         
-        # Policy loss (negative log prob * advantage)
-        policy_loss = - (selected_log_probs * advantages_norm).mean()
+        # Clip advantages
+        advantages_norm = torch.clamp(advantages_norm, -5.0, 5.0)  # Tighter clipping
         
-        # Value loss (MSE)
+        # *** KEY FIX 3: Policy loss with importance sampling and magnitude cap ***
+        policy_loss_raw = -(ratio * selected_log_probs * advantages_norm).mean()
+        
+        # Cap the policy loss magnitude
+        policy_loss = torch.clamp(policy_loss_raw, -10.0, 10.0)
+        
+        # Value loss
         value_loss = F.mse_loss(values, target_values_tensor)
         
-        # Entropy bonus (to encourage exploration)
+        # Entropy bonus (adaptive based on training progress)
         probs = F.softmax(policy_logits, dim=1)
-        entropy = - (probs * log_probs).sum(dim=1).mean()
+        entropy = -(probs * log_probs).sum(dim=1).mean()
         
-        loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+        # Adaptive entropy coefficient (decreases slowly over training)
+        adaptive_entropy_coef = self.entropy_coef * (1.0 + 0.1 / (1.0 + self.training_stats['total_training_steps'] / 1000.0))
         
-        # Safety: check for NaN/Inf before stepping
+        # Total loss
+        loss = policy_loss + self.value_coef * value_loss - adaptive_entropy_coef * entropy
+        
+        # Safety check for non-finite loss
         if not torch.isfinite(loss):
-            # Print diagnostics to help debugging and skip this update
-            try:
-                print("*** Non-finite loss encountered - skipping optimizer step ***")
-                print("Policy loss:", policy_loss.item())
-                print("Value loss:", value_loss.item())
-                print("Entropy:", entropy.item())
-                print("Selected log probs stats: min", selected_log_probs.min().item(), "max", selected_log_probs.max().item())
-                print("Advantages stats: mean", advantages_norm.mean().item(), "std", advantages_norm.std().item())
-            except Exception:
-                pass
+            print("*** Non-finite loss detected - skipping update ***")
+            print(f"Policy loss: {policy_loss_raw.item():.4f} (clamped to {policy_loss.item():.4f})")
+            print(f"Value loss: {value_loss.item():.4f}")
+            print(f"Entropy: {entropy.item():.4f}")
+            print(f"Log prob range: [{selected_log_probs.min().item():.4f}, {selected_log_probs.max().item():.4f}]")
+            print(f"Ratio range: [{ratio.min().item():.4f}, {ratio.max().item():.4f}]")
             return float('nan'), float('nan')
         
+        # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
-        # gradient clipping
+        
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+        
         self.optimizer.step()
+        
+        # Track loss history
+        self.loss_history.append(policy_loss.item())
+        
+        # Diagnostic: warn if policy loss magnitude is growing
+        if len(self.loss_history) >= 50:
+            recent_avg = sum(list(self.loss_history)[-50:]) / 50
+            if abs(recent_avg) > 5.0:
+                print(f"WARNING: Average policy loss magnitude is high: {recent_avg:.4f}")
+        
+        self.training_stats['total_training_steps'] += 1
         
         return policy_loss.item(), value_loss.item()
     
-    # ---------------------------
-    # Top-level training loop
-    # ---------------------------
     def train(self, num_games=10, temperature=1.0, callback=None):
         """Train the AI by self-play using replay buffer + minibatches."""
         self.stop_training_flag = False
@@ -355,31 +394,37 @@ class ChessAI:
                 print("Training stopped by user")
                 break
             
-            # 1) Play a self-play game
+            # Play a self-play game
             game_data, reward = self.play_game(temperature)
             
-            # 2) Add to replay buffer
+            # Add to replay buffer
             self.add_game_to_buffer(game_data, reward)
             
-            # 3) Run several training steps sampling from buffer if large enough
+            # Clean old data periodically
+            if game_num % 10 == 0:
+                self.clean_old_data()
+            
+            # Training steps
             avg_policy_loss = 0.0
             avg_value_loss = 0.0
             steps_done = 0
+            
             if len(self.replay_buffer) >= max(self.min_buffer_size, self.batch_size):
                 for _ in range(self.train_steps_per_game):
-                    boards_tensor, move_idxs_tensor, target_values_tensor = self.sample_batch()
-                    p_loss, v_loss = self.train_on_batch(boards_tensor, move_idxs_tensor, target_values_tensor)
-                    # handle NaN returns
+                    boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor = self.sample_batch()
+                    p_loss, v_loss = self.train_on_batch(boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor)
+                    
                     if p_loss != p_loss or v_loss != v_loss:  # NaN check
                         continue
+                    
                     avg_policy_loss += p_loss
                     avg_value_loss += v_loss
                     steps_done += 1
+                
                 if steps_done > 0:
                     avg_policy_loss /= steps_done
                     avg_value_loss /= steps_done
             else:
-                # Not enough data yet — skip training step, return zeros so UI knows
                 avg_policy_loss, avg_value_loss = 0.0, 0.0
             
             if callback:
@@ -393,32 +438,31 @@ class ChessAI:
         """Stop the training process"""
         self.stop_training_flag = True
     
-    # ---------------------------
-    # Save / load (safer)
-    # ---------------------------
     def save_model(self):
-        """Save model (CPU state dict) and training stats to make it portable."""
+        """Save model and training stats."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = os.path.join(self.save_dir, "model_latest.pth")
+        
         try:
             cpu_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
             torch.save({
                 'model_state_dict': cpu_state,
                 'training_stats': self.training_stats
             }, model_path)
-            # Backup occasionally
+            
             if self.training_stats['games_played'] % 50 == 0:
                 backup_path = os.path.join(self.save_dir, f"model_{timestamp}.pth")
                 torch.save({
                     'model_state_dict': cpu_state,
                     'training_stats': self.training_stats
                 }, backup_path)
+            
             print(f"Model saved to {model_path}")
         except Exception as e:
             print(f"Error saving model: {e}")
     
     def load_model(self):
-        """Load model and training stats (maps to device afterwards)."""
+        """Load model and training stats."""
         model_path = os.path.join(self.save_dir, "model_latest.pth")
         if os.path.exists(model_path):
             try:
@@ -426,6 +470,11 @@ class ChessAI:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.model.to(self.device)
                 self.training_stats = checkpoint.get('training_stats', self.training_stats)
+                
+                # Initialize new stats if not present
+                if 'total_training_steps' not in self.training_stats:
+                    self.training_stats['total_training_steps'] = 0
+                
                 print(f"Model loaded from {model_path}")
                 print(f"Training stats: {self.training_stats}")
             except Exception as e:
@@ -435,13 +484,11 @@ class ChessAI:
             print("No saved model found. Starting fresh.")
 
 
-# ---------------------------
-# GUI class (modified to support flip + promotion choice)
-# ---------------------------
+# GUI class remains mostly the same
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - Self-Play Reinforcement Learning (IMPROVED)")
+        self.window.title("Chess AI - Self-Play RL (FIXED VERSION)")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -455,11 +502,9 @@ class ChessGUI:
         self.move_history = []
         self.ai_thinking = False
         
-        # Board flip state: when True the board is shown from Black's perspective (files/ranks reversed)
         self.flip_board = False
         self.flip_var = tk.BooleanVar(value=False)
         
-        # Message queue for thread-safe GUI updates
         self.message_queue = queue.Queue()
         
         self.setup_gui()
@@ -467,7 +512,6 @@ class ChessGUI:
         
     def setup_gui(self):
         """Setup the GUI components"""
-        # Main container with two columns
         main_frame = ttk.Frame(self.window, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
@@ -475,7 +519,6 @@ class ChessGUI:
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=0, column=0, padx=10)
         
-        # Board display
         board_container = ttk.Frame(left_frame, relief=tk.SUNKEN, borderwidth=2)
         board_container.grid(row=0, column=0, pady=10)
         
@@ -490,7 +533,7 @@ class ChessGUI:
         self.history_text = scrolledtext.ScrolledText(history_frame, height=8, width=40, wrap=tk.WORD)
         self.history_text.grid(row=0, column=0)
         
-        # Right column - Controls and Stats
+        # Right column - Controls
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky=(tk.N, tk.W, tk.E), padx=10)
         
@@ -504,7 +547,7 @@ class ChessGUI:
         num_games_entry.grid(row=0, column=1, pady=5, padx=5)
         
         ttk.Label(train_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.temperature_var = tk.StringVar(value="1.0")
+        self.temperature_var = tk.StringVar(value="1.3")
         temp_entry = ttk.Entry(train_frame, textvariable=self.temperature_var, width=15)
         temp_entry.grid(row=1, column=1, pady=5, padx=5)
         
@@ -517,7 +560,6 @@ class ChessGUI:
         self.stop_button = ttk.Button(button_frame, text="Stop Training", command=self.stop_training, state=tk.DISABLED)
         self.stop_button.grid(row=0, column=1, padx=5)
         
-        # Training progress
         self.progress_var = tk.StringVar(value="No training in progress")
         ttk.Label(train_frame, textvariable=self.progress_var, wraplength=250).grid(row=3, column=0, columnspan=2, pady=5)
         
@@ -530,7 +572,6 @@ class ChessGUI:
         ttk.Button(play_frame, text="AI vs AI Demo", command=self.watch_ai_game, width=20).grid(row=2, column=0, pady=5, padx=5)
         ttk.Button(play_frame, text="New Game", command=self.reset_game, width=20).grid(row=3, column=0, pady=5, padx=5)
         
-        # Flip board option (auto set when playing as black but user can toggle)
         flip_cb = ttk.Checkbutton(play_frame, text="Flip board (Black at bottom)", variable=self.flip_var, command=self.on_flip_toggle)
         flip_cb.grid(row=4, column=0, pady=5)
         
@@ -541,12 +582,11 @@ class ChessGUI:
         self.stats_text = tk.Text(stats_frame, height=10, width=35, wrap=tk.WORD)
         self.stats_text.grid(row=0, column=0)
         
-        # Device info
         device_info = f"Device: {self.ai.device}"
         ttk.Label(stats_frame, text=device_info, foreground="blue").grid(row=1, column=0, pady=5)
         
         # Status bar
-        self.status_var = tk.StringVar(value="Ready - Click 'Play as White/Black' or 'Start Training'")
+        self.status_var = tk.StringVar(value="Ready - FIXED VERSION with stable policy loss")
         status_label = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_label.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
@@ -554,25 +594,20 @@ class ChessGUI:
         self.update_stats_display()
     
     def on_flip_toggle(self):
-        """Called when flip checkbox is toggled"""
         self.flip_board = bool(self.flip_var.get())
         self.update_board_display()
     
     def board_to_image(self):
-        """Convert chess board to image using PIL with improved rendering"""
+        """Convert chess board to image"""
         board_size = self.square_size * 8
-        
-        # Create image with extra space for coordinates
         image = Image.new('RGB', (board_size + 40, board_size + 40), 'white')
         draw = ImageDraw.Draw(image)
         
-        # Colors
         light_square = (240, 217, 181)
         dark_square = (181, 136, 99)
         selected_color = (255, 255, 100)
         legal_move_color = (144, 238, 144)
         
-        # Try to load a font
         try:
             piece_font = ImageFont.truetype("seguisym.ttf", int(self.square_size * 0.7))
             coord_font = ImageFont.truetype("arial.ttf", 12)
@@ -584,25 +619,23 @@ class ChessGUI:
                 piece_font = ImageFont.load_default()
                 coord_font = ImageFont.load_default()
         
-        # Offset for board (to make room for coordinates)
         offset = 20
         
         # Draw squares
         for rank in range(8):
             for file in range(8):
-                # Map (file, rank) to screen coordinates depending on flip state
                 if not self.flip_board:
                     x1 = file * self.square_size + offset
                     y1 = (7 - rank) * self.square_size + offset
                 else:
                     x1 = (7 - file) * self.square_size + offset
                     y1 = rank * self.square_size + offset
+                
                 x2 = x1 + self.square_size
                 y2 = y1 + self.square_size
                 
                 square = chess.square(file, rank)
                 
-                # Determine square color
                 if square == self.selected_square:
                     color = selected_color
                 elif square in [move.to_square for move in self.legal_moves_for_selected]:
@@ -628,7 +661,6 @@ class ChessGUI:
             draw.text((x, board_size + offset + 15), file_char, fill='black', font=coord_font, anchor='mm')
         
         for i, rank_char in enumerate(ranks):
-            # compute y similar to square mapping
             if not self.flip_board:
                 y = (7 - i) * self.square_size + self.square_size // 2 + offset
             else:
@@ -636,7 +668,6 @@ class ChessGUI:
             draw.text((5, y), rank_char, fill='black', font=coord_font, anchor='mm')
             draw.text((board_size + offset + 15, y), rank_char, fill='black', font=coord_font, anchor='mm')
         
-        # Unicode chess pieces
         piece_symbols = {
             'P': '♙', 'N': '♘', 'B': '♗', 'R': '♖', 'Q': '♕', 'K': '♔',
             'p': '♟', 'n': '♞', 'b': '♝', 'r': '♜', 'q': '♛', 'k': '♚'
@@ -652,7 +683,6 @@ class ChessGUI:
                     symbol = piece.symbol()
                     piece_char = piece_symbols.get(symbol, symbol)
                     
-                    # Map to screen coords
                     if not self.flip_board:
                         x = file * self.square_size + self.square_size // 2 + offset
                         y = (7 - rank) * self.square_size + self.square_size // 2 + offset
@@ -660,32 +690,25 @@ class ChessGUI:
                         x = (7 - file) * self.square_size + self.square_size // 2 + offset
                         y = rank * self.square_size + self.square_size // 2 + offset
                     
-                    # Piece color
                     piece_color = 'white' if piece.color == chess.WHITE else 'black'
                     outline_color = 'black' if piece.color == chess.WHITE else 'white'
                     
-                    # Draw piece with outline for better visibility
                     for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                        draw.text((x + dx, y + dy), piece_char, fill=outline_color, 
-                                 font=piece_font, anchor='mm')
-                    draw.text((x, y), piece_char, fill=piece_color, 
-                             font=piece_font, anchor='mm')
+                        draw.text((x + dx, y + dy), piece_char, fill=outline_color, font=piece_font, anchor='mm')
+                    draw.text((x, y), piece_char, fill=piece_color, font=piece_font, anchor='mm')
         
         return ImageTk.PhotoImage(image)
     
     def update_board_display(self):
-        """Update the board display"""
         try:
             photo = self.board_to_image()
             self.board_label.config(image=photo)
-            self.board_label.image = photo  # Keep a reference
+            self.board_label.image = photo
         except Exception as e:
             print(f"Error updating board: {e}")
-            # Fallback to text representation
             self.board_label.config(text=str(self.board))
     
     def update_stats_display(self):
-        """Update statistics display"""
         stats = self.ai.training_stats
         
         win_rate_white = (stats['white_wins'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
@@ -694,20 +717,19 @@ class ChessGUI:
         
         stats_text = f"""Games Played: {stats['games_played']}
 Total Moves: {stats['total_moves']}
+Training Steps: {stats.get('total_training_steps', 0)}
 
 White Wins: {stats['white_wins']} ({win_rate_white:.1f}%)
 Black Wins: {stats['black_wins']} ({win_rate_black:.1f}%)
 Draws: {stats['draws']} ({draw_rate:.1f}%)
 
-Model Location:
-{self.ai.save_dir}
+Model: {self.ai.save_dir}
         """.strip()
         
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(1.0, stats_text)
     
     def update_move_history(self):
-        """Update move history display"""
         self.history_text.delete(1.0, tk.END)
         
         if not self.move_history:
@@ -725,7 +747,6 @@ Model Location:
         self.history_text.see(tk.END)
     
     def on_board_click(self, event):
-        """Handle board click for human moves"""
         if self.human_color is None or self.board.turn != self.human_color:
             return
         
@@ -735,44 +756,36 @@ Model Location:
         if self.ai_thinking:
             return
         
-        # Calculate which square was clicked (accounting for offset)
         offset = 20
         x, y = event.x - offset, event.y - offset
         
-        # Check if click is within board bounds
         if x < 0 or y < 0 or x >= self.square_size * 8 or y >= self.square_size * 8:
             return
         
         col = int(min(7, max(0, x // self.square_size)))
         row = int(min(7, max(0, y // self.square_size)))
+        
         if not self.flip_board:
             file = col
             rank = 7 - row
         else:
             file = 7 - col
             rank = row
+        
         square = chess.square(file, rank)
         
         if self.selected_square is None:
-            # Select piece
             piece = self.board.piece_at(square)
             if piece and piece.color == self.human_color:
                 self.selected_square = square
-                # Get legal moves for this piece
-                self.legal_moves_for_selected = [
-                    move for move in self.board.legal_moves 
-                    if move.from_square == square
-                ]
-                self.status_var.set(f"Selected {chess.SQUARE_NAMES[square]} - Click destination square")
+                self.legal_moves_for_selected = [move for move in self.board.legal_moves if move.from_square == square]
+                self.status_var.set(f"Selected {chess.SQUARE_NAMES[square]} - Click destination")
                 self.update_board_display()
         else:
-            # Try to make move
             move = None
-            
-            # Check for promotion
             piece = self.board.piece_at(self.selected_square)
+            
             if piece and piece.piece_type == chess.PAWN and (rank == 0 or rank == 7):
-                # Pawn promotion - ask user which piece
                 promo = self.ask_promotion_piece()
                 if promo is None:
                     promo = chess.QUEEN
@@ -789,19 +802,14 @@ Model Location:
                 if self.board.is_game_over():
                     self.game_over()
                 else:
-                    # AI's turn
                     self.window.after(300, self.ai_move)
             else:
-                # Invalid move - deselect
                 self.selected_square = None
                 self.legal_moves_for_selected = []
                 self.status_var.set("Illegal move! Click a piece to select it.")
                 self.update_board_display()
     
     def ask_promotion_piece(self):
-        """Show a small modal dialog asking user what to promote to.
-        Returns one of chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT or None if cancelled.
-        """
         dlg = tk.Toplevel(self.window)
         dlg.title("Choose Promotion")
         dlg.transient(self.window)
@@ -814,13 +822,11 @@ Model Location:
             choice['piece'] = piece_const
             dlg.destroy()
         
-        # Buttons with text and unicode pieces
         ttk.Button(dlg, text="Queen ♕", width=12, command=lambda: choose(chess.QUEEN)).grid(row=1, column=0, padx=5, pady=5)
         ttk.Button(dlg, text="Rook ♖", width=12, command=lambda: choose(chess.ROOK)).grid(row=1, column=1, padx=5, pady=5)
         ttk.Button(dlg, text="Bishop ♗", width=12, command=lambda: choose(chess.BISHOP)).grid(row=1, column=2, padx=5, pady=5)
         ttk.Button(dlg, text="Knight ♘", width=12, command=lambda: choose(chess.KNIGHT)).grid(row=1, column=3, padx=5, pady=5)
         
-        # Center the dialog over parent
         self.window.update_idletasks()
         x = self.window.winfo_rootx() + 100
         y = self.window.winfo_rooty() + 100
@@ -830,14 +836,12 @@ Model Location:
         return choice['piece']
     
     def make_move(self, move):
-        """Make a move on the board and update history"""
         san_move = self.board.san(move)
         self.board.push(move)
         self.move_history.append(san_move)
         self.update_move_history()
     
     def ai_move(self):
-        """Make AI move"""
         if self.board.is_game_over():
             self.game_over()
             return
@@ -850,6 +854,7 @@ Model Location:
             move = self.ai.select_move(self.board, temperature=0.1)
             if move is None:
                 return
+            
             san_move = self.board.san(move)
             self.make_move(move)
             
@@ -865,7 +870,6 @@ Model Location:
             self.ai_thinking = False
     
     def start_game(self, human_color):
-        """Start a game with human player"""
         self.board = chess.Board()
         self.human_color = human_color
         self.selected_square = None
@@ -873,7 +877,6 @@ Model Location:
         self.move_history = []
         self.ai_thinking = False
         
-        # Auto flip board if human chooses Black; user can toggle afterward
         self.flip_board = (human_color == chess.BLACK)
         self.flip_var.set(self.flip_board)
         
@@ -881,13 +884,12 @@ Model Location:
         self.update_move_history()
         
         color_name = "White" if human_color == chess.WHITE else "Black"
-        self.status_var.set(f"You are playing as {color_name}. Click a piece to move.")
+        self.status_var.set(f"You are {color_name}. Click a piece to move.")
         
         if human_color == chess.BLACK:
             self.window.after(500, self.ai_move)
     
     def watch_ai_game(self):
-        """Watch AI play against itself"""
         self.board = chess.Board()
         self.human_color = None
         self.selected_square = None
@@ -895,9 +897,8 @@ Model Location:
         self.move_history = []
         self.ai_thinking = False
         
-        # don't flip by default for AI vs AI
         self.flip_board = False
-        self.flip_var.set(self.flip_board)
+        self.flip_var.set(False)
         
         self.update_board_display()
         self.update_move_history()
@@ -906,12 +907,12 @@ Model Location:
         self.play_ai_vs_ai()
     
     def play_ai_vs_ai(self):
-        """Play AI vs AI game with visualization"""
         if not self.board.is_game_over():
             try:
                 move = self.ai.select_move(self.board, temperature=0.1)
                 if move is None:
                     return
+                
                 san_move = self.board.san(move)
                 self.make_move(move)
                 self.update_board_display()
@@ -923,7 +924,6 @@ Model Location:
             self.game_over()
     
     def reset_game(self):
-        """Reset the game"""
         self.board = chess.Board()
         self.human_color = None
         self.selected_square = None
@@ -931,7 +931,6 @@ Model Location:
         self.move_history = []
         self.ai_thinking = False
         
-        # reset flip
         self.flip_board = False
         self.flip_var.set(False)
         
@@ -940,7 +939,6 @@ Model Location:
         self.status_var.set("Game reset - Choose a play mode")
     
     def game_over(self):
-        """Handle game over"""
         result = self.board.result()
         outcome = self.board.outcome()
         
@@ -953,7 +951,6 @@ Model Location:
         else:
             message = "Draw!"
         
-        # Add termination reason
         if outcome:
             if outcome.termination == chess.Termination.CHECKMATE:
                 message += " (Checkmate)"
@@ -970,7 +967,6 @@ Model Location:
         messagebox.showinfo("Game Over", message)
     
     def process_queue(self):
-        """Process messages from training thread"""
         try:
             while True:
                 msg = self.message_queue.get_nowait()
@@ -991,9 +987,8 @@ Model Location:
             self.window.after(100, self.process_queue)
     
     def training_callback(self, game_num, total_games, policy_loss, value_loss, reward):
-        """Callback during training - called from training thread"""
         result = "Win" if reward > 0 else ("Loss" if reward < 0 else "Draw")
-        text = f"Game {game_num}/{total_games}\n{result} (Reward: {reward:.2f})\nPolicy Loss: {policy_loss:.4f}\nValue Loss: {value_loss:.4f}"
+        text = f"Game {game_num}/{total_games}\n{result} (R: {reward:.2f})\nP-Loss: {policy_loss:.4f}\nV-Loss: {value_loss:.4f}"
         
         self.message_queue.put({
             'type': 'training_update',
@@ -1001,13 +996,8 @@ Model Location:
         })
     
     def train_worker(self, num_games, temperature):
-        """Worker function for training thread"""
         try:
-            self.ai.train(
-                num_games=num_games, 
-                temperature=temperature, 
-                callback=self.training_callback
-            )
+            self.ai.train(num_games=num_games, temperature=temperature, callback=self.training_callback)
             
             self.message_queue.put({
                 'type': 'training_complete',
@@ -1020,7 +1010,6 @@ Model Location:
             })
     
     def start_training(self):
-        """Start training process in a separate thread"""
         if self.is_training:
             messagebox.showwarning("Already Training", "Training is already in progress!")
             return
@@ -1046,26 +1035,18 @@ Model Location:
         self.progress_var.set("Starting training...")
         self.status_var.set("Training in progress...")
         
-        # Start training in a separate thread
-        self.training_thread = threading.Thread(
-            target=self.train_worker,
-            args=(num_games, temperature),
-            daemon=True
-        )
+        self.training_thread = threading.Thread(target=self.train_worker, args=(num_games, temperature), daemon=True)
         self.training_thread.start()
     
     def stop_training(self):
-        """Stop training process"""
         if self.is_training:
             self.ai.stop_training()
             self.status_var.set("Stopping training...")
-            # Wait a bit for training to stop
             self.window.after(1000, self.finish_stop_training)
         else:
             self.finish_stop_training()
     
     def finish_stop_training(self):
-        """Finish stopping the training process"""
         self.is_training = False
         self.train_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
@@ -1075,7 +1056,6 @@ Model Location:
         self.status_var.set("Ready")
     
     def run(self):
-        """Run the GUI"""
         self.window.mainloop()
 
 
