@@ -1,6 +1,6 @@
 """
 Chess AI with Self-Play Reinforcement Learning
-IMPROVED VERSION with FIXED policy loss stability
+IMPROVED VERSION with FIXED policy loss stability AND threefold repetition draw
 
 Key fixes for policy loss explosion:
 1. Clip log probabilities to prevent extreme negative values
@@ -9,6 +9,7 @@ Key fixes for policy loss explosion:
 4. Better replay buffer management with maximum age
 5. Adaptive entropy coefficient
 6. Enhanced diagnostics and loss monitoring
+7. **NEW: Automatic draw on threefold repetition**
 """
 
 import chess
@@ -211,6 +212,11 @@ class ChessAI:
         game_data = []
         
         while not board.is_game_over() and not self.stop_training_flag:
+            # **NEW: Check for threefold repetition and end game as draw**
+            if board.can_claim_threefold_repetition():
+                print(f"Draw by threefold repetition detected at move {len(game_data)}")
+                break
+            
             board_tensor = self.board_to_tensor(board).cpu()
             move = self.select_move(board, temperature)
             
@@ -242,7 +248,7 @@ class ChessAI:
             reward = -1.0
             self.training_stats['black_wins'] += 1
         else:
-            reward = 0 # Draw
+            reward = 0.0  # Draw
             self.training_stats['draws'] += 1
         
         self.training_stats['games_played'] += 1
@@ -488,7 +494,7 @@ class ChessAI:
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - Self-Play RL (FIXED VERSION)")
+        self.window.title("Chess AI - Self-Play RL (FIXED + Threefold Repetition)")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -586,7 +592,7 @@ class ChessGUI:
         ttk.Label(stats_frame, text=device_info, foreground="blue").grid(row=1, column=0, pady=5)
         
         # Status bar
-        self.status_var = tk.StringVar(value="Ready - FIXED VERSION with stable policy loss")
+        self.status_var = tk.StringVar(value="Ready - With threefold repetition draw detection")
         status_label = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_label.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
@@ -799,7 +805,7 @@ Model: {self.ai.save_dir}
                 self.legal_moves_for_selected = []
                 self.update_board_display()
                 
-                if self.board.is_game_over():
+                if self.board.is_game_over() or self.board.can_claim_threefold_repetition():
                     self.game_over()
                 else:
                     self.window.after(300, self.ai_move)
@@ -842,7 +848,7 @@ Model: {self.ai.save_dir}
         self.update_move_history()
     
     def ai_move(self):
-        if self.board.is_game_over():
+        if self.board.is_game_over() or self.board.can_claim_threefold_repetition():
             self.game_over()
             return
         
@@ -861,7 +867,7 @@ Model: {self.ai.save_dir}
             self.status_var.set(f"AI played: {san_move}")
             self.update_board_display()
             
-            if self.board.is_game_over():
+            if self.board.is_game_over() or self.board.can_claim_threefold_repetition():
                 self.game_over()
         except Exception as e:
             self.status_var.set(f"Error: {e}")
@@ -907,7 +913,7 @@ Model: {self.ai.save_dir}
         self.play_ai_vs_ai()
     
     def play_ai_vs_ai(self):
-        if not self.board.is_game_over():
+        if not self.board.is_game_over() and not self.board.can_claim_threefold_repetition():
             try:
                 move = self.ai.select_move(self.board, temperature=0.1)
                 if move is None:
@@ -941,6 +947,13 @@ Model: {self.ai.save_dir}
     def game_over(self):
         result = self.board.result()
         outcome = self.board.outcome()
+        
+        # Check for threefold repetition
+        if self.board.can_claim_threefold_repetition():
+            message = "Draw by threefold repetition!"
+            self.status_var.set(f"Game Over: {message} - Result: 1/2-1/2")
+            messagebox.showinfo("Game Over", message)
+            return
         
         if outcome is None:
             message = "Game ended"
