@@ -11,7 +11,7 @@ Key fixes for policy loss explosion:
 5. Adaptive entropy coefficient
 6. Enhanced diagnostics and loss monitoring
 7. Automatic draw on threefold repetition
-8. NEW: Draw penalty (-0.1 by default) to encourage winning play
+8. NEW: Draw penalty (-0.5 by default) to encourage winning play
 """
 
 import chess
@@ -94,7 +94,7 @@ class ChessAI:
                  lr=1e-4, 
                  weight_decay=1e-5,
                  max_data_age=4000,
-                 draw_penalty=-0.1):  # NEW: Configurable draw penalty
+                 draw_penalty=-0.2):  # NEW: Configurable draw penalty
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
