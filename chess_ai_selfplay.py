@@ -107,7 +107,7 @@ class ChessAI:
                  weight_decay=1e-5,
                  max_data_age=4000,
                  draw_penalty=-0.2,
-                 mcts_simulations=8,
+                 mcts_simulations=32,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
                  mcts_dirichlet_alpha=0.03):
