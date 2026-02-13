@@ -540,7 +540,7 @@ class ChessAI:
     # -------------------------
     # Self-play / data collection with temperature schedule
     # -------------------------
-    def play_game(self, temperature=1.0, max_moves=400, temp_threshold=15):
+    def play_game(self, temperature=1.0, max_moves=200, temp_threshold=15):
         """
         Play a single self-play game using batched MCTS with temperature schedule.
         
