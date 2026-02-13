@@ -1,6 +1,11 @@
 """
 Chess AI with Self-Play Reinforcement Learning + Batched MCTS
-PRODUCTION VERSION with all optimizations:
+PRODUCTION VERSION with all optimizations + CRITICAL BUG FIXES:
+
+CRITICAL BUG FIXES:
+- ✅ FIXED: Board now represented from current player's perspective
+- ✅ FIXED: Black can now learn to win (was always from White's view)
+- ✅ Board flipped for Black to ensure symmetry in learning
 
 PERFORMANCE OPTIMIZATIONS:
 - Batched MCTS evaluation (10-50x faster than sequential)
@@ -15,12 +20,6 @@ LEARNING QUALITY IMPROVEMENTS:
 - ✅ Gradient clipping (1.0) for stability
 - ✅ L2 weight decay (1e-4) for regularization
 - ✅ Corrected virtual-loss bookkeeping in MCTS
-
-BUG FIXES:
-- Fixed view/reshape for channels-last compatibility
-- Fixed virtual loss implementation
-- Added best_move guards
-- Explicit eval result mapping
 """
 
 import chess
@@ -49,6 +48,7 @@ class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
         # Input: 8x8x12 board representation (6 piece types x 2 colors)
+        # NOW: Always from current player's perspective
         self.conv1 = nn.Conv2d(12, 128, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
@@ -120,20 +120,20 @@ class ChessAI:
                  replay_capacity=30000,
                  batch_size=256,
                  train_steps_per_game=16,
-                 entropy_coef=0.02,
+                 entropy_coef=0.01,
                  value_coef=1.5, 
                  clip_grad=1.0, 
                  min_buffer_size=1500,
                  lr=1e-4, 
-                 weight_decay=1e-4,  # Increased for better regularization
-                 max_data_age=4000,
-                 draw_penalty=-0.2,
-                 mcts_simulations=32,
+                 weight_decay=1e-4,
+                 max_data_age=2000,
+                 draw_penalty=-0.5,
+                 mcts_simulations=64,
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
-                 mcts_dirichlet_alpha=0.3,  # Chess-scale branching factor
-                 use_amp=True):  # Mixed precision
+                 mcts_dirichlet_alpha=0.3,
+                 use_amp=True):
         """
         use_amp: Enable automatic mixed precision (2-3x faster on modern GPUs)
         """
@@ -190,10 +190,23 @@ class ChessAI:
         self.load_model()
     
     # -------------------------
-    # Board / move helpers
+    # Board / move helpers (FIXED!)
     # -------------------------
     def board_to_tensor(self, board):
-        """Convert chess board to neural network input tensor. Returns CPU tensor shape (1,12,8,8)."""
+        """
+        Convert chess board to neural network input tensor from CURRENT PLAYER'S perspective.
+        
+        CRITICAL FIX: Board is now always represented from the perspective of the player
+        whose turn it is. This allows the network to learn symmetrically for both colors.
+        
+        Channels 0-5: Current player's pieces (Pawn, Knight, Bishop, Rook, Queen, King)
+        Channels 6-11: Opponent's pieces (Pawn, Knight, Bishop, Rook, Queen, King)
+        
+        For Black's turn, the board is also flipped vertically so Black always "sees"
+        from their side of the board.
+        
+        Returns CPU tensor shape (1,12,8,8).
+        """
         tensor = np.zeros((12, 8, 8), dtype=np.float32)
         
         piece_to_channel = {
@@ -201,25 +214,57 @@ class ChessAI:
             chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
         }
         
+        current_player = board.turn  # Whose turn is it?
+        
         for sq in chess.SQUARES:
             p = board.piece_at(sq)
             if p:
                 ch = piece_to_channel[p.piece_type]
-                if p.color == chess.BLACK:
+                
+                # Put current player's pieces in channels 0-5
+                # Put opponent's pieces in channels 6-11
+                if p.color != current_player:
                     ch += 6
+                
                 file = chess.square_file(sq)
                 rank = chess.square_rank(sq)
+                
+                # Flip board vertically for Black (so Black always plays "up" the board)
+                if current_player == chess.BLACK:
+                    rank = 7 - rank
+                
                 tensor[ch, rank, file] = 1.0
         
         return torch.from_numpy(tensor).unsqueeze(0)  # (1,12,8,8) on CPU
     
-    def move_to_index(self, move):
-        """Compact encoding: from*64 + to"""
-        return move.from_square * 64 + move.to_square
+    def move_to_index(self, move, flip=False):
+        """
+        Compact encoding: from*64 + to
+        If flip=True, flip the move for Black's perspective
+        """
+        from_sq = move.from_square
+        to_sq = move.to_square
+        
+        if flip:
+            # Flip ranks for Black
+            from_file, from_rank = chess.square_file(from_sq), chess.square_rank(from_sq)
+            to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
+            from_sq = chess.square(from_file, 7 - from_rank)
+            to_sq = chess.square(to_file, 7 - to_rank)
+        
+        return from_sq * 64 + to_sq
     
-    def index_to_move(self, board, idx):
+    def index_to_move(self, board, idx, flip=False):
+        """Convert index back to move, with optional flip for Black"""
         from_sq = idx // 64
         to_sq = idx % 64
+        
+        if flip:
+            # Unflip the squares
+            from_file, from_rank = chess.square_file(from_sq), chess.square_rank(from_sq)
+            to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
+            from_sq = chess.square(from_file, 7 - from_rank)
+            to_sq = chess.square(to_file, 7 - to_rank)
         
         candidate = chess.Move(from_sq, to_sq)
         if candidate in board.legal_moves:
@@ -241,7 +286,8 @@ class ChessAI:
     # -------------------------
     def evaluate_batch(self, board_list):
         """
-        Evaluate multiple positions at once with masked softmax (no wasted compute!).
+        Evaluate multiple positions at once with masked softmax.
+        Now correctly handles flipped board representation.
         Returns list of (move_probs, value) tuples.
         """
         if len(board_list) == 0:
@@ -270,13 +316,16 @@ class ChessAI:
                 logits = policy_logits[i]  # Shape: (4096,)
                 value = float(values[i])
                 
-                # Create mask for legal moves (MASKED SOFTMAX - no wasted compute!)
+                # Determine if we need to flip (Black's perspective)
+                flip = (board.turn == chess.BLACK)
+                
+                # Create mask for legal moves (MASKED SOFTMAX)
                 legal_moves = list(board.legal_moves)
                 mask = torch.full((4096,), -float('inf'))
                 legal_indices = []
                 
                 for move in legal_moves:
-                    idx = self.move_to_index(move)
+                    idx = self.move_to_index(move, flip=flip)
                     if idx < 4096:
                         mask[idx] = 0.0
                         legal_indices.append(idx)
@@ -288,7 +337,7 @@ class ChessAI:
                 # Extract probabilities for legal moves
                 legal_move_probs = []
                 for move in legal_moves:
-                    idx = self.move_to_index(move)
+                    idx = self.move_to_index(move, flip=flip)
                     if idx < 4096:
                         legal_move_probs.append((move, float(move_probs_tensor[idx])))
                     else:
@@ -389,12 +438,15 @@ class ChessAI:
             for idx, node in enumerate(leaf_nodes):
                 if node.board.is_game_over():
                     res = node.board.result()
+                    # CRITICAL FIX: Evaluate from ROOT player's perspective
+                    # The root board's turn is who is doing the MCTS search
                     if res == "1-0":
-                        terminal_values.append(1.0)
+                        value = 1.0 if root_board.turn == chess.WHITE else -1.0
                     elif res == "0-1":
-                        terminal_values.append(-1.0)
+                        value = -1.0 if root_board.turn == chess.WHITE else 1.0
                     else:
-                        terminal_values.append(self.draw_penalty)
+                        value = self.draw_penalty
+                    terminal_values.append(value)
                 else:
                     boards_to_evaluate.append(node.board)
                     terminal_values.append(None)
@@ -488,7 +540,7 @@ class ChessAI:
     # -------------------------
     # Self-play / data collection with temperature schedule
     # -------------------------
-    def play_game(self, temperature=1.0, max_moves=120, temp_threshold=15):
+    def play_game(self, temperature=1.0, max_moves=400, temp_threshold=15):
         """
         Play a single self-play game using batched MCTS with temperature schedule.
         
@@ -518,7 +570,9 @@ class ChessAI:
             if move is None:
                 break
             
-            move_idx = self.move_to_index(move)
+            # Store move index WITH flip if Black is moving
+            flip = (board.turn == chess.BLACK)
+            move_idx = self.move_to_index(move, flip=flip)
             player = board.turn
             
             # Compute log prob for importance sampling
@@ -566,14 +620,37 @@ class ChessAI:
         return game_data, reward, is_threefold
     
     # -------------------------
-    # Replay buffer
+    # Replay buffer (FIXED!)
     # -------------------------
     def add_game_to_buffer(self, game_data, reward, is_draw=False):
+        """
+        Add game to replay buffer with CORRECT reward assignment.
+        
+        The reward is from the game's perspective (White wins = +1, Black wins = -1).
+        But we store the value from each player's perspective for training.
+        
+        Since board_tensor is already from the current player's perspective,
+        we need to assign rewards correctly:
+        - If I'm White and White won (reward=+1): target = +1 (good for me)
+        - If I'm Black and White won (reward=+1): target = -1 (bad for me)
+        - If I'm White and Black won (reward=-1): target = -1 (bad for me)
+        - If I'm Black and Black won (reward=-1): target = +1 (good for me)
+        
+        So the formula is: target = reward if player==WHITE else -reward
+        """
         for board_tensor_cpu, move_idx, player, old_log_prob in game_data:
             if move_idx is None:
                 continue
             
-            target_value = self.draw_penalty if is_draw else (reward if player == chess.WHITE else -reward)
+            if is_draw:
+                target_value = self.draw_penalty
+            else:
+                # Reward is from game perspective (White=+1, Black=-1)
+                # Convert to player perspective
+                if player == chess.WHITE:
+                    target_value = reward  # White wins = +1 is good, Black wins = -1 is bad
+                else:
+                    target_value = -reward  # White wins = +1 is bad, Black wins = -1 is good
             
             self.replay_buffer.append((
                 board_tensor_cpu,
@@ -804,12 +881,12 @@ class ChessAI:
 
 
 # -------------------------
-# GUI (unchanged from previous version)
+# GUI (unchanged)
 # -------------------------
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - Production (AMP + Temp Schedule + Dirichlet)")
+        self.window.title("Chess AI - FIXED (Symmetric Learning)")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -903,7 +980,7 @@ class ChessGUI:
         amp_status = "AMP: ON" if self.ai.use_amp else "AMP: OFF"
         ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=1, column=0, pady=2)
         ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=2, column=0, pady=2)
-        ttk.Label(stats_frame, text=f"Dirichlet α={self.ai.mcts_dirichlet_alpha}", foreground="purple").grid(row=3, column=0, pady=2)
+        ttk.Label(stats_frame, text="🎯 FIXED VERSION - Black can win!", foreground="red", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
         
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
