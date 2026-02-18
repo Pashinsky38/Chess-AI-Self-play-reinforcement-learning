@@ -22,7 +22,6 @@ LEARNING QUALITY IMPROVEMENTS:
 - ✅ Corrected virtual-loss bookkeeping in MCTS
 - ✅ SAFE DATA AUGMENTATION: Horizontal flip with full validation (castling, en passant)
 - ✅ LEARNING RATE SCHEDULER: Warmup (1000 steps) + Cosine decay for stable convergence
-<<<<<<< HEAD
 
 DRAW COLLAPSE FIXES:
 - ✅ draw_penalty=-0.3: Draws now cost something, preventing reward collapse
@@ -30,8 +29,6 @@ DRAW COLLAPSE FIXES:
     into the VALUE TARGET, not just end-of-game reward
 - ✅ Games continue through repetitions (no early exit) - model must escape or suffer
 - ✅ temp_threshold raised to 30: Keeps exploration alive deeper into games
-=======
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
 """
 
 import chess
@@ -95,11 +92,7 @@ class ChessNet(nn.Module):
 
 
 # -------------------------
-<<<<<<< HEAD
 # Chess AI with Batched MCTS + SAFE AUGMENTATION + REPETITION PENALTY
-=======
-# Chess AI with Batched MCTS (FIXED) + SAFE AUGMENTATION
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
 # -------------------------
 class ChessAI:
     class MCTSNode:
@@ -121,21 +114,17 @@ class ChessAI:
 
     def __init__(self, save_dir="chess_ai_models",
                  replay_capacity=30000,
-                 batch_size=256,
+                 batch_size=128,
                  train_steps_per_game=16,
                  entropy_coef=0.01,
                  value_coef=1.5,
                  clip_grad=1.0,
-                 min_buffer_size=1500,
+                 min_buffer_size=200,
                  lr=1e-4,
                  weight_decay=1e-4,
                  max_data_age=2000,
-<<<<<<< HEAD
                  draw_penalty=-0.3,          # FIX: was 0.0 — draws now cost something
                  repetition_penalty=-0.15,   # FIX: per-position penalty applied inline
-=======
-                 draw_penalty=0.0,
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
                  mcts_simulations=256,
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
@@ -151,34 +140,17 @@ class ChessAI:
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         
-<<<<<<< HEAD
-=======
-        # Learning rate scheduler with warmup and cosine decay
-        # Configure total decay length to something close to your expected training steps
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         self.scheduler_total_steps = 50000
         warmup_steps = 1000
         
         def lr_lambda(step):
-<<<<<<< HEAD
             if step < warmup_steps:
                 return float(step + 1) / float(max(1, warmup_steps))
-=======
-            # step is 0-based (LambdaLR passes last_epoch)
-            # 1) linear warmup from step=0..warmup_steps-1, but start at 1/warmup_steps (non-zero)
-            if step < warmup_steps:
-                return float(step + 1) / float(max(1, warmup_steps))
-            # 2) cosine decay across scheduler_total_steps after warmup
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             progress = min(1.0, float(step - warmup_steps) / float(max(1, self.scheduler_total_steps - warmup_steps)))
             return 0.5 * (1.0 + math.cos(math.pi * progress))
         
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         
-<<<<<<< HEAD
-=======
-        # Mixed precision training
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         self.use_amp = use_amp and self.device.type == 'cuda'
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
         
@@ -190,14 +162,9 @@ class ChessAI:
             'black_wins': 0,
             'draws': 0,
             'total_training_steps': 0,
-<<<<<<< HEAD
             'positions_flipped': 0,
             'positions_total': 0,
             'repetition_penalties_applied': 0,
-=======
-            'positions_flipped': 0,  # Track augmentation effectiveness
-            'positions_total': 0
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         }
         self.stop_training_flag = False
         
@@ -279,7 +246,6 @@ class ChessAI:
         return None
 
     # -------------------------
-<<<<<<< HEAD
     # Safe augmentation
     # -------------------------
     def is_position_symmetric_safe(self, board):
@@ -306,75 +272,6 @@ class ChessAI:
 
     # -------------------------
     # Batched network inference
-=======
-    # SAFE DATA AUGMENTATION (NEW!)
-    # -------------------------
-    def is_position_symmetric_safe(self, board):
-        """
-        Check if position can be safely horizontally flipped.
-        
-        CRITICAL CHECKS:
-        1. No castling rights (otherwise kingside/queenside flip incorrectly)
-        2. No en passant square (otherwise target square flips incorrectly)
-        
-        Returns: True only if horizontal flip is valid
-        """
-        # Check castling rights - if any exist, don't flip
-        if board.has_kingside_castling_rights(chess.WHITE):
-            return False
-        if board.has_queenside_castling_rights(chess.WHITE):
-            return False
-        if board.has_kingside_castling_rights(chess.BLACK):
-            return False
-        if board.has_queenside_castling_rights(chess.BLACK):
-            return False
-        
-        # Check en passant - if target exists, don't flip
-        if board.ep_square is not None:
-            return False
-        
-        # Position can be safely flipped
-        return True
-    
-    def augment_tensor_and_index(self, board_tensor, move_idx, can_flip=False):
-        """
-        Augment tensor representation (for replay buffer).
-        
-        Args:
-            board_tensor: Tensor representation (from board_to_tensor)
-            move_idx: Move index (from_sq * 64 + to_sq)
-            can_flip: Whether this position passed is_position_symmetric_safe check
-        
-        Returns:
-            List of (tensor, move_idx) tuples
-        """
-        # Always include original
-        augmented = [(board_tensor.clone(), move_idx)]
-        
-        # Only flip if safe
-        if can_flip:
-            # Flip tensor along file dimension (axis 3)
-            flipped_tensor = torch.flip(board_tensor, [3])
-            
-            # Flip move index
-            from_sq = move_idx // 64
-            to_sq = move_idx % 64
-            
-            from_file, from_rank = from_sq % 8, from_sq // 8
-            to_file, to_rank = to_sq % 8, to_sq // 8
-            
-            # Mirror files (a↔h, b↔g, c↔f, d↔e)
-            from_sq_flipped = (7 - from_file) + from_rank * 8
-            to_sq_flipped = (7 - to_file) + to_rank * 8
-            move_idx_flipped = from_sq_flipped * 64 + to_sq_flipped
-            
-            augmented.append((flipped_tensor, move_idx_flipped))
-        
-        return augmented
-
-    # -------------------------
-    # Batched network inference with masked softmax
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
     # -------------------------
     def evaluate_batch(self, board_list):
         if len(board_list) == 0:
@@ -386,11 +283,6 @@ class ChessAI:
             batch_tensor = torch.cat(board_tensors, dim=0).to(self.device)
             if self.device.type == 'cuda':
                 batch_tensor = batch_tensor.to(memory_format=torch.channels_last)
-<<<<<<< HEAD
-=======
-            
-            # Mixed precision inference
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
                 policy_logits, values = self.model(batch_tensor)
             policy_logits = policy_logits.cpu()
@@ -583,7 +475,6 @@ class ChessAI:
         return np.random.choice(moves, p=probs)
     
     # -------------------------
-<<<<<<< HEAD
     # Self-play with inline repetition penalty (NEW!)
     # -------------------------
     def play_game(self, temperature=1.0, max_moves=300, temp_threshold=30):
@@ -597,20 +488,6 @@ class ChessAI:
 
         This means the model must ESCAPE repetition loops or keep paying a tax,
         rather than exploiting them as a free shortcut to a 0-reward draw.
-=======
-    # Self-play / data collection with temperature schedule + AUGMENTATION TRACKING
-    # -------------------------
-    def play_game(self, temperature=1.0, max_moves=300, temp_threshold=15):
-        """
-        Play a single self-play game using batched MCTS with temperature schedule.
-        NOW: Tracks which positions are safe to flip for augmentation.
-        
-        Temperature schedule (AlphaZero-style):
-        - Moves 1-temp_threshold: Use full temperature for exploration
-        - After temp_threshold: Use temperature=0 for best play
-        
-        This encourages opening diversity while playing optimally in endgames.
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         """
         board = chess.Board()
         game_data = []
@@ -620,7 +497,6 @@ class ChessAI:
         position_counts = {}
 
         while not board.is_game_over() and not self.stop_training_flag:
-<<<<<<< HEAD
             fen_key = board.board_fen()
             visit_count = position_counts.get(fen_key, 0)
             position_counts[fen_key] = visit_count + 1
@@ -635,15 +511,6 @@ class ChessAI:
                 inline_penalty = 0.0
 
             can_flip = self.is_position_symmetric_safe(board)
-=======
-            if board.can_claim_threefold_repetition():
-                is_threefold = True
-                break
-            
-            # AUGMENTATION: Check if position can be safely flipped (before move is made)
-            can_flip = self.is_position_symmetric_safe(board)
-            
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             board_tensor = self.board_to_tensor(board).cpu()
 
             current_temp = temperature if move_count < temp_threshold else 0.0
@@ -663,10 +530,6 @@ class ChessAI:
                 board_tensor_device = board_tensor.to(self.device)
                 if self.device.type == 'cuda':
                     board_tensor_device = board_tensor_device.to(memory_format=torch.channels_last)
-<<<<<<< HEAD
-=======
-                
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
                 with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
                     policy_logits, _ = self.model(board_tensor_device)
                 log_probs = F.log_softmax(policy_logits, dim=1)
@@ -674,15 +537,9 @@ class ChessAI:
                     move_log_prob = log_probs[0, move_idx].item()
                 else:
                     move_log_prob = -10.0
-<<<<<<< HEAD
 
             # Store inline_penalty alongside data so add_game_to_buffer can apply it
             game_data.append((board_tensor, move_idx, player, move_log_prob, can_flip, inline_penalty))
-=======
-            
-            # AUGMENTATION: Store with can_flip flag
-            game_data.append((board_tensor, move_idx, player, move_log_prob, can_flip))
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             board.push(move)
             move_count += 1
 
@@ -707,15 +564,10 @@ class ChessAI:
         return game_data, reward
 
     # -------------------------
-<<<<<<< HEAD
     # Replay buffer with inline repetition penalty applied to value target
-=======
-    # Replay buffer (FIXED!) + SAFE AUGMENTATION
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
     # -------------------------
     def add_game_to_buffer(self, game_data, reward):
         """
-<<<<<<< HEAD
         Add game to replay buffer.
 
         VALUE TARGET = game_outcome (from player's perspective)
@@ -724,25 +576,6 @@ class ChessAI:
         The inline penalty is clamped so it can't flip the sign past -1.
         """
         for board_tensor_cpu, move_idx, player, old_log_prob, can_flip, inline_penalty in game_data:
-=======
-        Add game to replay buffer with CORRECT reward assignment + SAFE AUGMENTATION.
-        
-        The reward is from the game's perspective (White wins = +1, Black wins = -1).
-        But we store the value from each player's perspective for training.
-        
-        Since board_tensor is already from the current player's perspective,
-        we need to assign rewards correctly:
-        - If I'm White and White won (reward=+1): target = +1 (good for me)
-        - If I'm Black and White won (reward=+1): target = -1 (bad for me)
-        - If I'm White and Black won (reward=-1): target = -1 (bad for me)
-        - If I'm Black and Black won (reward=-1): target = +1 (good for me)
-        
-        So the formula is: target = reward if player==WHITE else -reward
-        
-        AUGMENTATION: Only flips positions that passed symmetry checks.
-        """
-        for board_tensor_cpu, move_idx, player, old_log_prob, can_flip in game_data:
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             if move_idx is None:
                 continue
 
@@ -750,7 +583,6 @@ class ChessAI:
             if player == chess.WHITE:
                 base_value = reward
             else:
-<<<<<<< HEAD
                 base_value = -reward
 
             # Apply inline repetition penalty and clamp to valid range
@@ -762,23 +594,6 @@ class ChessAI:
             if can_flip:
                 self.training_stats['positions_flipped'] += 1
 
-=======
-                # Reward is from game perspective (White=+1, Black=-1)
-                # Convert to player perspective
-                if player == chess.WHITE:
-                    target_value = reward  # White wins = +1 is good, Black wins = -1 is bad
-                else:
-                    target_value = -reward  # White wins = +1 is bad, Black wins = -1 is good
-            
-            # SAFE AUGMENTATION: Only flip if position was validated
-            augmented = self.augment_tensor_and_index(board_tensor_cpu, move_idx, can_flip)
-            
-            # Track statistics
-            self.training_stats['positions_total'] += 1
-            if can_flip:
-                self.training_stats['positions_flipped'] += 1
-            
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             for aug_tensor, aug_move_idx in augmented:
                 self.replay_buffer.append((
                     aug_tensor,
@@ -787,11 +602,7 @@ class ChessAI:
                     old_log_prob,
                     self.data_counter
                 ))
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
             self.data_counter += 1
     
     def clean_old_data(self):
@@ -825,11 +636,6 @@ class ChessAI:
     # -------------------------
     def train_on_batch(self, boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor):
         self.model.train()
-<<<<<<< HEAD
-=======
-        
-        # Mixed precision training
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
             policy_logits, values = self.model(boards_tensor)
             log_probs = F.log_softmax(policy_logits, dim=1)
@@ -873,14 +679,7 @@ class ChessAI:
         except:
             self.loss_history.append(0.0)
         
-        # increment training step counter (used by logs / adaptive coeffs)
         self.training_stats['total_training_steps'] += 1
-        try:
-            self.scheduler.step()
-        except Exception:
-            pass
-        
-        # step LR scheduler (LambdaLR uses epoch number semantics; stepping here keeps it aligned)
         try:
             self.scheduler.step()
         except Exception:
@@ -971,7 +770,6 @@ class ChessAI:
                 if self.device.type == 'cuda':
                     self.model = self.model.to(memory_format=torch.channels_last)
                 self.training_stats = checkpoint.get('training_stats', self.training_stats)
-<<<<<<< HEAD
                 # Backwards compatibility
                 for key in ['positions_flipped', 'positions_total', 'total_training_steps', 'repetition_penalties_applied']:
                     if key not in self.training_stats:
@@ -980,21 +778,6 @@ class ChessAI:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 if 'scheduler_state_dict' in checkpoint:
                     self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-=======
-                
-                # Add new stats if not present (backwards compatibility)
-                if 'positions_flipped' not in self.training_stats:
-                    self.training_stats['positions_flipped'] = 0
-                if 'positions_total' not in self.training_stats:
-                    self.training_stats['positions_total'] = 0
-                
-                if 'optimizer_state_dict' in checkpoint:
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                
-                if 'scheduler_state_dict' in checkpoint:
-                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 print(f"Model loaded from {model_path}")
@@ -1006,20 +789,12 @@ class ChessAI:
 
 
 # -------------------------
-<<<<<<< HEAD
 # GUI
-=======
-# GUI (with augmentation stats)
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
 # -------------------------
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-<<<<<<< HEAD
         self.window.title("Chess AI - Draw Collapse Fix")
-=======
-        self.window.title("Chess AI - FIXED + SAFE AUGMENTATION + LR SCHEDULER")
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -1109,24 +884,14 @@ class ChessGUI:
         stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding="10")
         stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
-<<<<<<< HEAD
         self.stats_text = tk.Text(stats_frame, height=16, width=35, wrap=tk.WORD)
-=======
-        self.stats_text = tk.Text(stats_frame, height=14, width=35, wrap=tk.WORD)
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         self.stats_text.grid(row=0, column=0)
         ttk.Button(stats_frame, text="Copy Stats", command=self.copy_stats, width=15).grid(row=1, column=0, pady=2)
 
         amp_status = "AMP: ON" if self.ai.use_amp else "AMP: OFF"
-<<<<<<< HEAD
         ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=2, column=0, pady=2)
         ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=3, column=0, pady=2)
         ttk.Label(stats_frame, text="✅ DRAW COLLAPSE FIX ACTIVE", foreground="red", font=('Arial', 9, 'bold')).grid(row=4, column=0, pady=2)
-=======
-        ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=1, column=0, pady=2)
-        ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=2, column=0, pady=2)
-        ttk.Label(stats_frame, text="✅ AUGMENTATION + LR SCHEDULER", foreground="purple", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
@@ -1244,12 +1009,6 @@ class ChessGUI:
         current_lr = self.ai.optimizer.param_groups[0]['lr']
         rep_penalties = stats.get('repetition_penalties_applied', 0)
         
-        # Calculate augmentation rate
-        flip_rate = (stats['positions_flipped'] / stats['positions_total'] * 100) if stats['positions_total'] > 0 else 0
-        
-        # Get current learning rate
-        current_lr = self.ai.optimizer.param_groups[0]['lr']
-        
         stats_text = f"""Games: {stats['games_played']}
 Moves: {stats['total_moves']}
 Steps: {stats.get('total_training_steps', 0)}
@@ -1260,17 +1019,11 @@ Draws: {stats['draws']} ({draw_rate:.1f}%)
 
 Buffer: {len(self.ai.replay_buffer)}
 Augmentation: {flip_rate:.1f}% flipped
-<<<<<<< HEAD
 Rep.penalties: {rep_penalties}
 LR: {current_lr:.2e}
 Draw penalty: {self.ai.draw_penalty}
 Rep penalty: {self.ai.repetition_penalty}
 Model: {self.ai.save_dir}""".strip()
-=======
-LR: {current_lr:.2e}
-Model: {self.ai.save_dir}
-        """.strip()
->>>>>>> 1bb91eb896d0387088d218e1ba99cfeb31f80bd8
         
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(1.0, stats_text)
