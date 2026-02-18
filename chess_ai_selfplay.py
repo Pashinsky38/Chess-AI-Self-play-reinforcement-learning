@@ -1,6 +1,6 @@
 """
 Chess AI with Self-Play Reinforcement Learning + Batched MCTS
-PRODUCTION VERSION with all optimizations + CRITICAL BUG FIXES:
+PRODUCTION VERSION with all optimizations + CRITICAL BUG FIXES + SAFE AUGMENTATION + LR SCHEDULER:
 
 CRITICAL BUG FIXES:
 - ✅ FIXED: Board now represented from current player's perspective
@@ -20,6 +20,8 @@ LEARNING QUALITY IMPROVEMENTS:
 - ✅ Gradient clipping (1.0) for stability
 - ✅ L2 weight decay (1e-4) for regularization
 - ✅ Corrected virtual-loss bookkeeping in MCTS
+- ✅ SAFE DATA AUGMENTATION: Horizontal flip with full validation (castling, en passant)
+- ✅ LEARNING RATE SCHEDULER: Warmup (1000 steps) + Cosine decay for stable convergence
 """
 
 import chess
@@ -94,7 +96,7 @@ class ChessNet(nn.Module):
 
 
 # -------------------------
-# Chess AI with Batched MCTS (FIXED)
+# Chess AI with Batched MCTS (FIXED) + SAFE AUGMENTATION
 # -------------------------
 class ChessAI:
     class MCTSNode:
@@ -127,8 +129,8 @@ class ChessAI:
                  lr=1e-4, 
                  weight_decay=1e-4,
                  max_data_age=2000,
-                 draw_penalty=-0.5,
-                 mcts_simulations=64,
+                 draw_penalty=0.0,
+                 mcts_simulations=256,
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
@@ -146,6 +148,22 @@ class ChessAI:
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         
+        # Learning rate scheduler with warmup and cosine decay
+        # Configure total decay length to something close to your expected training steps
+        self.scheduler_total_steps = 50000
+        warmup_steps = 1000
+        
+        def lr_lambda(step):
+            # step is 0-based (LambdaLR passes last_epoch)
+            # 1) linear warmup from step=0..warmup_steps-1, but start at 1/warmup_steps (non-zero)
+            if step < warmup_steps:
+                return float(step + 1) / float(max(1, warmup_steps))
+            # 2) cosine decay across scheduler_total_steps after warmup
+            progress = min(1.0, float(step - warmup_steps) / float(max(1, self.scheduler_total_steps - warmup_steps)))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        
         # Mixed precision training
         self.use_amp = use_amp and self.device.type == 'cuda'
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
@@ -157,7 +175,9 @@ class ChessAI:
             'white_wins': 0,
             'black_wins': 0,
             'draws': 0,
-            'total_training_steps': 0
+            'total_training_steps': 0,
+            'positions_flipped': 0,  # Track augmentation effectiveness
+            'positions_total': 0
         }
         self.stop_training_flag = False
         
@@ -282,6 +302,72 @@ class ChessAI:
         return None
 
     # -------------------------
+    # SAFE DATA AUGMENTATION (NEW!)
+    # -------------------------
+    def is_position_symmetric_safe(self, board):
+        """
+        Check if position can be safely horizontally flipped.
+        
+        CRITICAL CHECKS:
+        1. No castling rights (otherwise kingside/queenside flip incorrectly)
+        2. No en passant square (otherwise target square flips incorrectly)
+        
+        Returns: True only if horizontal flip is valid
+        """
+        # Check castling rights - if any exist, don't flip
+        if board.has_kingside_castling_rights(chess.WHITE):
+            return False
+        if board.has_queenside_castling_rights(chess.WHITE):
+            return False
+        if board.has_kingside_castling_rights(chess.BLACK):
+            return False
+        if board.has_queenside_castling_rights(chess.BLACK):
+            return False
+        
+        # Check en passant - if target exists, don't flip
+        if board.ep_square is not None:
+            return False
+        
+        # Position can be safely flipped
+        return True
+    
+    def augment_tensor_and_index(self, board_tensor, move_idx, can_flip=False):
+        """
+        Augment tensor representation (for replay buffer).
+        
+        Args:
+            board_tensor: Tensor representation (from board_to_tensor)
+            move_idx: Move index (from_sq * 64 + to_sq)
+            can_flip: Whether this position passed is_position_symmetric_safe check
+        
+        Returns:
+            List of (tensor, move_idx) tuples
+        """
+        # Always include original
+        augmented = [(board_tensor.clone(), move_idx)]
+        
+        # Only flip if safe
+        if can_flip:
+            # Flip tensor along file dimension (axis 3)
+            flipped_tensor = torch.flip(board_tensor, [3])
+            
+            # Flip move index
+            from_sq = move_idx // 64
+            to_sq = move_idx % 64
+            
+            from_file, from_rank = from_sq % 8, from_sq // 8
+            to_file, to_rank = to_sq % 8, to_sq // 8
+            
+            # Mirror files (a↔h, b↔g, c↔f, d↔e)
+            from_sq_flipped = (7 - from_file) + from_rank * 8
+            to_sq_flipped = (7 - to_file) + to_rank * 8
+            move_idx_flipped = from_sq_flipped * 64 + to_sq_flipped
+            
+            augmented.append((flipped_tensor, move_idx_flipped))
+        
+        return augmented
+
+    # -------------------------
     # Batched network inference with masked softmax
     # -------------------------
     def evaluate_batch(self, board_list):
@@ -304,7 +390,7 @@ class ChessAI:
                 batch_tensor = batch_tensor.to(memory_format=torch.channels_last)
             
             # Mixed precision inference
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
                 policy_logits, values = self.model(batch_tensor)
             
             # Move to CPU for processing
@@ -538,11 +624,12 @@ class ChessAI:
         return np.random.choice(moves, p=probs)
     
     # -------------------------
-    # Self-play / data collection with temperature schedule
+    # Self-play / data collection with temperature schedule + AUGMENTATION TRACKING
     # -------------------------
-    def play_game(self, temperature=1.0, max_moves=200, temp_threshold=15):
+    def play_game(self, temperature=1.0, max_moves=300, temp_threshold=15):
         """
         Play a single self-play game using batched MCTS with temperature schedule.
+        NOW: Tracks which positions are safe to flip for augmentation.
         
         Temperature schedule (AlphaZero-style):
         - Moves 1-temp_threshold: Use full temperature for exploration
@@ -559,6 +646,9 @@ class ChessAI:
             if board.can_claim_threefold_repetition():
                 is_threefold = True
                 break
+            
+            # AUGMENTATION: Check if position can be safely flipped (before move is made)
+            can_flip = self.is_position_symmetric_safe(board)
             
             board_tensor = self.board_to_tensor(board).cpu()
             
@@ -582,7 +672,7 @@ class ChessAI:
                 if self.device.type == 'cuda':
                     board_tensor_device = board_tensor_device.to(memory_format=torch.channels_last)
                 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
                     policy_logits, _ = self.model(board_tensor_device)
                 
                 log_probs = F.log_softmax(policy_logits, dim=1)
@@ -591,7 +681,8 @@ class ChessAI:
                 else:
                     move_log_prob = -10.0
             
-            game_data.append((board_tensor, move_idx, player, move_log_prob))
+            # AUGMENTATION: Store with can_flip flag
+            game_data.append((board_tensor, move_idx, player, move_log_prob, can_flip))
             board.push(move)
             move_count += 1
             
@@ -620,11 +711,11 @@ class ChessAI:
         return game_data, reward, is_threefold
     
     # -------------------------
-    # Replay buffer (FIXED!)
+    # Replay buffer (FIXED!) + SAFE AUGMENTATION
     # -------------------------
     def add_game_to_buffer(self, game_data, reward, is_draw=False):
         """
-        Add game to replay buffer with CORRECT reward assignment.
+        Add game to replay buffer with CORRECT reward assignment + SAFE AUGMENTATION.
         
         The reward is from the game's perspective (White wins = +1, Black wins = -1).
         But we store the value from each player's perspective for training.
@@ -637,8 +728,10 @@ class ChessAI:
         - If I'm Black and Black won (reward=-1): target = +1 (good for me)
         
         So the formula is: target = reward if player==WHITE else -reward
+        
+        AUGMENTATION: Only flips positions that passed symmetry checks.
         """
-        for board_tensor_cpu, move_idx, player, old_log_prob in game_data:
+        for board_tensor_cpu, move_idx, player, old_log_prob, can_flip in game_data:
             if move_idx is None:
                 continue
             
@@ -652,13 +745,23 @@ class ChessAI:
                 else:
                     target_value = -reward  # White wins = +1 is bad, Black wins = -1 is good
             
-            self.replay_buffer.append((
-                board_tensor_cpu,
-                move_idx,
-                target_value,
-                old_log_prob,
-                self.data_counter
-            ))
+            # SAFE AUGMENTATION: Only flip if position was validated
+            augmented = self.augment_tensor_and_index(board_tensor_cpu, move_idx, can_flip)
+            
+            # Track statistics
+            self.training_stats['positions_total'] += 1
+            if can_flip:
+                self.training_stats['positions_flipped'] += 1
+            
+            for aug_tensor, aug_move_idx in augmented:
+                self.replay_buffer.append((
+                    aug_tensor,
+                    aug_move_idx,
+                    target_value,
+                    old_log_prob,
+                    self.data_counter
+                ))
+            
             self.data_counter += 1
     
     def clean_old_data(self):
@@ -700,7 +803,7 @@ class ChessAI:
         self.model.train()
         
         # Mixed precision training
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
             policy_logits, values = self.model(boards_tensor)
             
             # Compute losses
@@ -757,7 +860,14 @@ class ChessAI:
         except:
             self.loss_history.append(0.0)
         
+        # increment training step counter (used by logs / adaptive coeffs)
         self.training_stats['total_training_steps'] += 1
+        
+        # step LR scheduler (LambdaLR uses epoch number semantics; stepping here keeps it aligned)
+        try:
+            self.scheduler.step()
+        except Exception:
+            pass
         
         return policy_loss.item(), value_loss.item()
     
@@ -836,7 +946,8 @@ class ChessAI:
             save_dict = {
                 'model_state_dict': cpu_state,
                 'training_stats': self.training_stats,
-                'optimizer_state_dict': self.optimizer.state_dict()
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict()
             }
             if self.scaler:
                 save_dict['scaler_state_dict'] = self.scaler.state_dict()
@@ -863,8 +974,17 @@ class ChessAI:
                 
                 self.training_stats = checkpoint.get('training_stats', self.training_stats)
                 
+                # Add new stats if not present (backwards compatibility)
+                if 'positions_flipped' not in self.training_stats:
+                    self.training_stats['positions_flipped'] = 0
+                if 'positions_total' not in self.training_stats:
+                    self.training_stats['positions_total'] = 0
+                
                 if 'optimizer_state_dict' in checkpoint:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -881,12 +1001,12 @@ class ChessAI:
 
 
 # -------------------------
-# GUI (unchanged)
+# GUI (with augmentation stats)
 # -------------------------
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - FIXED (Symmetric Learning)")
+        self.window.title("Chess AI - FIXED + SAFE AUGMENTATION + LR SCHEDULER")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -974,13 +1094,13 @@ class ChessGUI:
         stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding="10")
         stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
-        self.stats_text = tk.Text(stats_frame, height=12, width=35, wrap=tk.WORD)
+        self.stats_text = tk.Text(stats_frame, height=14, width=35, wrap=tk.WORD)
         self.stats_text.grid(row=0, column=0)
         
         amp_status = "AMP: ON" if self.ai.use_amp else "AMP: OFF"
         ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=1, column=0, pady=2)
         ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=2, column=0, pady=2)
-        ttk.Label(stats_frame, text="🎯 FIXED VERSION - Black can win!", foreground="red", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
+        ttk.Label(stats_frame, text="✅ AUGMENTATION + LR SCHEDULER", foreground="purple", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
         
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
@@ -1104,6 +1224,12 @@ class ChessGUI:
         win_rate_black = (stats['black_wins'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
         draw_rate = (stats['draws'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
         
+        # Calculate augmentation rate
+        flip_rate = (stats['positions_flipped'] / stats['positions_total'] * 100) if stats['positions_total'] > 0 else 0
+        
+        # Get current learning rate
+        current_lr = self.ai.optimizer.param_groups[0]['lr']
+        
         stats_text = f"""Games: {stats['games_played']}
 Moves: {stats['total_moves']}
 Steps: {stats.get('total_training_steps', 0)}
@@ -1113,6 +1239,8 @@ Black: {stats['black_wins']} ({win_rate_black:.1f}%)
 Draws: {stats['draws']} ({draw_rate:.1f}%)
 
 Buffer: {len(self.ai.replay_buffer)}
+Augmentation: {flip_rate:.1f}% flipped
+LR: {current_lr:.2e}
 Model: {self.ai.save_dir}
         """.strip()
         
