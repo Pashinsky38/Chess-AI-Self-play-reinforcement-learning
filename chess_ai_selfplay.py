@@ -125,7 +125,7 @@ class ChessAI:
                  max_data_age=2000,
                  draw_penalty=-0.3,          # FIX: was 0.0 — draws now cost something
                  repetition_penalty=-0.15,   # FIX: per-position penalty applied inline
-                 mcts_simulations=64,
+                 mcts_simulations=256,
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
@@ -321,9 +321,18 @@ class ChessAI:
     # -------------------------
     # Batched MCTS
     # -------------------------
-    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False):
+    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False, game_position_counts=None):
+        """
+        Run MCTS with batched neural network evaluation and CORRECT virtual loss.
+
+        game_position_counts: dict of {board_fen: visit_count} from the current game.
+        Leaf nodes whose position has already been seen in the real game get their
+        value penalized directly, so MCTS steers away from repetition during search.
+        """
         if simulations is None:
             simulations = self.mcts_simulations
+        if game_position_counts is None:
+            game_position_counts = {}
         
         root = self.MCTSNode(root_board.copy(), parent=None, prior=0.0)
         move_probs, value = self.get_move_probabilities(root.board)
@@ -399,6 +408,16 @@ class ChessAI:
             for eval_idx, node_idx in enumerate(eval_index_map):
                 node = leaf_nodes[node_idx]
                 mv_probs, leaf_value = eval_results[eval_idx]
+
+                # Apply repetition penalty if this leaf position was already seen in the game.
+                # Penalty scales with how many times it has been visited, same as play_game.
+                leaf_fen = node.board.board_fen()
+                prior_visits = game_position_counts.get(leaf_fen, 0)
+                if prior_visits >= 1:
+                    leaf_value = float(np.clip(
+                        leaf_value + self.repetition_penalty * prior_visits, -1.0, 1.0
+                    ))
+
                 leaf_values[node_idx] = leaf_value
                 for move, prob in mv_probs:
                     if move not in node.children:
@@ -426,7 +445,7 @@ class ChessAI:
     # -------------------------
     # Move selection
     # -------------------------
-    def select_move(self, board, temperature=1.0, use_mcts=True, add_dirichlet_noise=False):
+    def select_move(self, board, temperature=1.0, use_mcts=True, add_dirichlet_noise=False, game_position_counts=None):
         if not use_mcts:
             move_probs, _ = self.get_move_probabilities(board)
             if not move_probs:
@@ -441,7 +460,9 @@ class ChessAI:
             probs = probs / probs.sum()
             return np.random.choice(moves, p=probs)
         
-        root = self.run_mcts_batched(board, simulations=self.mcts_simulations, add_dirichlet_noise=add_dirichlet_noise)
+        root = self.run_mcts_batched(board, simulations=self.mcts_simulations,
+                                     add_dirichlet_noise=add_dirichlet_noise,
+                                     game_position_counts=game_position_counts)
         if not root.children:
             return None
         moves = list(root.children.keys())
@@ -456,7 +477,7 @@ class ChessAI:
     # -------------------------
     # Self-play with inline repetition penalty (NEW!)
     # -------------------------
-    def play_game(self, temperature=1.0, max_moves=200, temp_threshold=30):
+    def play_game(self, temperature=1.0, max_moves=300, temp_threshold=30):
         """
         Play a self-play game with inline repetition penalty.
 
@@ -493,7 +514,9 @@ class ChessAI:
             board_tensor = self.board_to_tensor(board).cpu()
 
             current_temp = temperature if move_count < temp_threshold else 0.0
-            move = self.select_move(board, temperature=current_temp, use_mcts=True, add_dirichlet_noise=True)
+            move = self.select_move(board, temperature=current_temp, use_mcts=True,
+                                    add_dirichlet_noise=True,
+                                    game_position_counts=position_counts)
 
             if move is None:
                 break
@@ -787,6 +810,8 @@ class ChessGUI:
         self.flip_board = False
         self.flip_var = tk.BooleanVar(value=False)
         self.message_queue = queue.Queue()
+        self.ai_vs_ai_running = False
+        self.ai_vs_ai_paused = False
         
         self.setup_gui()
         self.process_queue()
@@ -810,6 +835,7 @@ class ChessGUI:
         
         self.history_text = scrolledtext.ScrolledText(history_frame, height=8, width=40, wrap=tk.WORD)
         self.history_text.grid(row=0, column=0)
+        ttk.Button(history_frame, text="Copy Moves", command=self.copy_moves, width=15).grid(row=1, column=0, pady=2)
         
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky=(tk.N, tk.W, tk.E), padx=10)
@@ -850,19 +876,22 @@ class ChessGUI:
         ttk.Button(play_frame, text="Play as White", command=lambda: self.start_game(chess.WHITE), width=20).grid(row=0, column=0, pady=5)
         ttk.Button(play_frame, text="Play as Black", command=lambda: self.start_game(chess.BLACK), width=20).grid(row=1, column=0, pady=5)
         ttk.Button(play_frame, text="AI vs AI Demo", command=self.watch_ai_game, width=20).grid(row=2, column=0, pady=5)
-        ttk.Button(play_frame, text="New Game", command=self.reset_game, width=20).grid(row=3, column=0, pady=5)
-        ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var, command=self.on_flip_toggle).grid(row=4, column=0, pady=5)
+        self.pause_button = ttk.Button(play_frame, text="Pause", command=self.toggle_pause_ai_game, width=20, state=tk.DISABLED)
+        self.pause_button.grid(row=3, column=0, pady=5)
+        ttk.Button(play_frame, text="New Game", command=self.reset_game, width=20).grid(row=4, column=0, pady=5)
+        ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var, command=self.on_flip_toggle).grid(row=5, column=0, pady=5)
         
         stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding="10")
         stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.stats_text = tk.Text(stats_frame, height=16, width=35, wrap=tk.WORD)
         self.stats_text.grid(row=0, column=0)
-        
+        ttk.Button(stats_frame, text="Copy Stats", command=self.copy_stats, width=15).grid(row=1, column=0, pady=2)
+
         amp_status = "AMP: ON" if self.ai.use_amp else "AMP: OFF"
-        ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=1, column=0, pady=2)
-        ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=2, column=0, pady=2)
-        ttk.Label(stats_frame, text="✅ DRAW COLLAPSE FIX ACTIVE", foreground="red", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
+        ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=2, column=0, pady=2)
+        ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=3, column=0, pady=2)
+        ttk.Label(stats_frame, text="✅ DRAW COLLAPSE FIX ACTIVE", foreground="red", font=('Arial', 9, 'bold')).grid(row=4, column=0, pady=2)
         
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
@@ -1119,11 +1148,20 @@ Model: {self.ai.save_dir}""".strip()
         self.move_history = []
         self.flip_board = False
         self.flip_var.set(False)
+        self.ai_vs_ai_running = True
+        self.ai_vs_ai_paused = False
+        self.pause_button.config(text="Pause", state=tk.NORMAL)
         self.update_board_display()
         self.update_move_history()
         self.play_ai_vs_ai()
     
     def play_ai_vs_ai(self):
+        if not self.ai_vs_ai_running:
+            return
+        if self.ai_vs_ai_paused:
+            # Check again in 200ms without making a move
+            self.window.after(200, self.play_ai_vs_ai)
+            return
         if not self.board.is_game_over():
             try:
                 move = self.ai.select_move(self.board, temperature=0.1, use_mcts=True)
@@ -1133,10 +1171,18 @@ Model: {self.ai.save_dir}""".strip()
                     self.window.after(800, self.play_ai_vs_ai)
             except Exception as e:
                 self.status_var.set(f"Error: {e}")
+                self.ai_vs_ai_running = False
+                self.pause_button.config(state=tk.DISABLED)
         else:
+            self.ai_vs_ai_running = False
+            self.pause_button.config(text="Pause", state=tk.DISABLED)
             self.game_over()
     
     def reset_game(self):
+        # Stop any running AI vs AI game first
+        self.ai_vs_ai_running = False
+        self.ai_vs_ai_paused = False
+        self.pause_button.config(text="Pause", state=tk.DISABLED)
         self.board = chess.Board()
         self.human_color = None
         self.selected_square = None
@@ -1225,6 +1271,25 @@ Model: {self.ai.save_dir}""".strip()
         self.update_stats_display()
         self.status_var.set("Ready")
     
+    def toggle_pause_ai_game(self):
+        if not self.ai_vs_ai_running:
+            return
+        self.ai_vs_ai_paused = not self.ai_vs_ai_paused
+        self.pause_button.config(text="Resume" if self.ai_vs_ai_paused else "Pause")
+        self.status_var.set("AI vs AI paused" if self.ai_vs_ai_paused else "AI vs AI running...")
+
+    def copy_stats(self):
+        text = self.stats_text.get(1.0, tk.END).strip()
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self.status_var.set("Stats copied to clipboard")
+
+    def copy_moves(self):
+        text = self.history_text.get(1.0, tk.END).strip()
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self.status_var.set("Move history copied to clipboard")
+
     def run(self):
         self.window.mainloop()
 
