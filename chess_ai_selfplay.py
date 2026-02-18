@@ -1,11 +1,13 @@
 """
 Chess AI with Self-Play Reinforcement Learning + Batched MCTS
-PRODUCTION VERSION with all optimizations + CRITICAL BUG FIXES:
+PRODUCTION VERSION with all optimizations + CRITICAL BUG FIXES + SAFE AUGMENTATION + LR SCHEDULER:
 
 CRITICAL BUG FIXES:
 - ✅ FIXED: Board now represented from current player's perspective
 - ✅ FIXED: Black can now learn to win (was always from White's view)
 - ✅ Board flipped for Black to ensure symmetry in learning
+- ✅ FIXED: Threading race condition - model_lock prevents concurrent forward passes
+           that caused "element 0 of tensors does not require grad" error
 
 PERFORMANCE OPTIMIZATIONS:
 - Batched MCTS evaluation (10-50x faster than sequential)
@@ -20,6 +22,8 @@ LEARNING QUALITY IMPROVEMENTS:
 - ✅ Gradient clipping (1.0) for stability
 - ✅ L2 weight decay (1e-4) for regularization
 - ✅ Corrected virtual-loss bookkeeping in MCTS
+- ✅ SAFE DATA AUGMENTATION: Horizontal flip with full validation (castling, en passant)
+- ✅ LEARNING RATE SCHEDULER: Warmup (1000 steps) + Cosine decay for stable convergence
 """
 
 import chess
@@ -47,24 +51,19 @@ import time
 class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
-        # Input: 8x8x12 board representation (6 piece types x 2 colors)
-        # NOW: Always from current player's perspective
         self.conv1 = nn.Conv2d(12, 128, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         
         self.fc1 = nn.Linear(128 * 8 * 8, 512)
         
-        # Policy head (move probabilities)
-        self.policy_fc = nn.Linear(512, 4096)  # 64*64 possible moves (from-to)
+        self.policy_fc = nn.Linear(512, 4096)
         
-        # Value head (position evaluation)
         self.value_fc1 = nn.Linear(512, 128)
         self.value_fc2 = nn.Linear(128, 1)
         
         self.dropout = nn.Dropout(0.3)
         
-        # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
                 if hasattr(m, "weight") and m.weight is not None:
@@ -73,28 +72,20 @@ class ChessNet(nn.Module):
                     nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
-        # x: (B,12,8,8)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
         x = torch.relu(self.conv3(x))
-        
-        # Flatten - use reshape instead of view for channels-last compatibility
         x = x.reshape(-1, 128 * 8 * 8)
         x = torch.relu(self.fc1(x))
         x = self.dropout(x)
-        
-        # Policy head
-        policy = self.policy_fc(x)  # (B,4096)
-        
-        # Value head
+        policy = self.policy_fc(x)
         value = torch.relu(self.value_fc1(x))
-        value = torch.tanh(self.value_fc2(value))  # in [-1,1]
-        
-        return policy, value.squeeze(-1)  # Return (B,4096) and (B,) for cleaner shapes
+        value = torch.tanh(self.value_fc2(value))
+        return policy, value.squeeze(-1)
 
 
 # -------------------------
-# Chess AI with Batched MCTS (FIXED)
+# Chess AI with Batched MCTS (FIXED) + SAFE AUGMENTATION
 # -------------------------
 class ChessAI:
     class MCTSNode:
@@ -102,18 +93,16 @@ class ChessAI:
             self.board = board
             self.parent = parent
             self.prior = prior
-            self.children = {}  # move -> MCTSNode
+            self.children = {}
             self.visits = 0
             self.value_sum = 0.0
-            self.virtual_loss_count = 0  # Track how many virtual losses are active
+            self.virtual_loss_count = 0
 
         @property
         def q_value(self):
-            # Correct virtual loss implementation: treat virtual losses as temporary visits
             total_visits = self.visits + self.virtual_loss_count
             if total_visits == 0:
                 return 0.0
-            # Virtual losses add negative value to discourage re-exploration
             return self.value_sum / total_visits
 
     def __init__(self, save_dir="chess_ai_models",
@@ -121,32 +110,38 @@ class ChessAI:
                  batch_size=256,
                  train_steps_per_game=16,
                  entropy_coef=0.01,
-                 value_coef=1.5, 
-                 clip_grad=1.0, 
+                 value_coef=1.5,
+                 clip_grad=1.0,
                  min_buffer_size=1500,
-                 lr=1e-4, 
+                 lr=1e-4,
                  weight_decay=1e-4,
                  max_data_age=2000,
-                 draw_penalty=-0.5,
-                 mcts_simulations=64,
+                 draw_penalty=0.0,
+                 mcts_simulations=256,
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
                  mcts_dirichlet_alpha=0.3,
                  use_amp=True):
-        """
-        use_amp: Enable automatic mixed precision (2-3x faster on modern GPUs)
-        """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
         
-        # Enable channels-last memory format for better conv performance
         if self.device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         
-        # Mixed precision training
+        self.scheduler_total_steps = 50000
+        warmup_steps = 1000
+        
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step + 1) / float(max(1, warmup_steps))
+            progress = min(1.0, float(step - warmup_steps) / float(max(1, self.scheduler_total_steps - warmup_steps)))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        
         self.use_amp = use_amp and self.device.type == 'cuda'
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
         
@@ -157,11 +152,22 @@ class ChessAI:
             'white_wins': 0,
             'black_wins': 0,
             'draws': 0,
-            'total_training_steps': 0
+            'total_training_steps': 0,
+            'positions_flipped': 0,
+            'positions_total': 0
         }
         self.stop_training_flag = False
+
+        # -------------------------------------------------------
+        # FIX: Single lock to serialize all model forward passes.
+        # Without this, the AI-vs-AI demo (main thread) and the
+        # training loop (background thread) call model() at the
+        # same time, corrupting the autograd graph and producing:
+        #   "element 0 of tensors does not require grad and does
+        #    not have grad_fn"
+        # -------------------------------------------------------
+        self.model_lock = threading.Lock()
         
-        # Replay buffer parameters
         self.replay_capacity = replay_capacity
         self.replay_buffer = deque(maxlen=replay_capacity)
         self.batch_size = batch_size
@@ -173,210 +179,171 @@ class ChessAI:
         self.max_data_age = max_data_age
         self.draw_penalty = draw_penalty
         
-        # MCTS params
         self.mcts_simulations = mcts_simulations
         self.mcts_batch_size = mcts_batch_size
         self.mcts_c_puct = mcts_c_puct
         self.mcts_dirichlet_eps = mcts_dirichlet_eps
         self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
         
-        # Track data age for each entry
         self.data_counter = 0
-        
-        # Loss history for monitoring
         self.loss_history = deque(maxlen=100)
         
         os.makedirs(save_dir, exist_ok=True)
         self.load_model()
     
     # -------------------------
-    # Board / move helpers (FIXED!)
+    # Board / move helpers
     # -------------------------
     def board_to_tensor(self, board):
-        """
-        Convert chess board to neural network input tensor from CURRENT PLAYER'S perspective.
-        
-        CRITICAL FIX: Board is now always represented from the perspective of the player
-        whose turn it is. This allows the network to learn symmetrically for both colors.
-        
-        Channels 0-5: Current player's pieces (Pawn, Knight, Bishop, Rook, Queen, King)
-        Channels 6-11: Opponent's pieces (Pawn, Knight, Bishop, Rook, Queen, King)
-        
-        For Black's turn, the board is also flipped vertically so Black always "sees"
-        from their side of the board.
-        
-        Returns CPU tensor shape (1,12,8,8).
-        """
         tensor = np.zeros((12, 8, 8), dtype=np.float32)
-        
         piece_to_channel = {
             chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
             chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
         }
-        
-        current_player = board.turn  # Whose turn is it?
-        
+        current_player = board.turn
         for sq in chess.SQUARES:
             p = board.piece_at(sq)
             if p:
                 ch = piece_to_channel[p.piece_type]
-                
-                # Put current player's pieces in channels 0-5
-                # Put opponent's pieces in channels 6-11
                 if p.color != current_player:
                     ch += 6
-                
                 file = chess.square_file(sq)
                 rank = chess.square_rank(sq)
-                
-                # Flip board vertically for Black (so Black always plays "up" the board)
                 if current_player == chess.BLACK:
                     rank = 7 - rank
-                
                 tensor[ch, rank, file] = 1.0
-        
-        return torch.from_numpy(tensor).unsqueeze(0)  # (1,12,8,8) on CPU
+        return torch.from_numpy(tensor).unsqueeze(0)
     
     def move_to_index(self, move, flip=False):
-        """
-        Compact encoding: from*64 + to
-        If flip=True, flip the move for Black's perspective
-        """
         from_sq = move.from_square
         to_sq = move.to_square
-        
         if flip:
-            # Flip ranks for Black
             from_file, from_rank = chess.square_file(from_sq), chess.square_rank(from_sq)
             to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
             from_sq = chess.square(from_file, 7 - from_rank)
             to_sq = chess.square(to_file, 7 - to_rank)
-        
         return from_sq * 64 + to_sq
     
     def index_to_move(self, board, idx, flip=False):
-        """Convert index back to move, with optional flip for Black"""
         from_sq = idx // 64
         to_sq = idx % 64
-        
         if flip:
-            # Unflip the squares
             from_file, from_rank = chess.square_file(from_sq), chess.square_rank(from_sq)
             to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
             from_sq = chess.square(from_file, 7 - from_rank)
             to_sq = chess.square(to_file, 7 - to_rank)
-        
         candidate = chess.Move(from_sq, to_sq)
         if candidate in board.legal_moves:
             return candidate
-        
         for promo_piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
             m = chess.Move(from_sq, to_sq, promotion=promo_piece)
             if m in board.legal_moves:
                 return m
-        
         for m in board.legal_moves:
             if m.from_square == from_sq and m.to_square == to_sq:
                 return m
-        
         return None
 
     # -------------------------
-    # Batched network inference with masked softmax
+    # SAFE DATA AUGMENTATION
+    # -------------------------
+    def is_position_symmetric_safe(self, board):
+        if board.has_kingside_castling_rights(chess.WHITE):
+            return False
+        if board.has_queenside_castling_rights(chess.WHITE):
+            return False
+        if board.has_kingside_castling_rights(chess.BLACK):
+            return False
+        if board.has_queenside_castling_rights(chess.BLACK):
+            return False
+        if board.ep_square is not None:
+            return False
+        return True
+    
+    def augment_tensor_and_index(self, board_tensor, move_idx, can_flip=False):
+        augmented = [(board_tensor.clone(), move_idx)]
+        if can_flip:
+            flipped_tensor = torch.flip(board_tensor, [3])
+            from_sq = move_idx // 64
+            to_sq = move_idx % 64
+            from_file, from_rank = from_sq % 8, from_sq // 8
+            to_file, to_rank = to_sq % 8, to_sq // 8
+            from_sq_flipped = (7 - from_file) + from_rank * 8
+            to_sq_flipped = (7 - to_file) + to_rank * 8
+            move_idx_flipped = from_sq_flipped * 64 + to_sq_flipped
+            augmented.append((flipped_tensor, move_idx_flipped))
+        return augmented
+
+    # -------------------------
+    # Batched network inference — LOCK PROTECTED
     # -------------------------
     def evaluate_batch(self, board_list):
         """
-        Evaluate multiple positions at once with masked softmax.
-        Now correctly handles flipped board representation.
-        Returns list of (move_probs, value) tuples.
+        Evaluate multiple positions at once.
+        Uses model_lock to prevent concurrent access with the training thread.
         """
         if len(board_list) == 0:
             return []
         
-        self.model.eval()
-        with torch.no_grad():
-            # Stack all boards into a single batch tensor
-            board_tensors = [self.board_to_tensor(board) for board in board_list]
-            batch_tensor = torch.cat(board_tensors, dim=0).to(self.device)
-            
-            # Use channels-last format if available
-            if self.device.type == 'cuda':
-                batch_tensor = batch_tensor.to(memory_format=torch.channels_last)
-            
-            # Mixed precision inference
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                policy_logits, values = self.model(batch_tensor)
-            
-            # Move to CPU for processing
+        board_tensors = [self.board_to_tensor(board) for board in board_list]
+        batch_tensor = torch.cat(board_tensors, dim=0).to(self.device)
+        if self.device.type == 'cuda':
+            batch_tensor = batch_tensor.to(memory_format=torch.channels_last)
+        
+        # Acquire lock before touching the model
+        with self.model_lock:
+            self.model.eval()
+            with torch.no_grad():
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    policy_logits, values = self.model(batch_tensor)
             policy_logits = policy_logits.cpu()
             values = values.cpu().numpy()
-            
-            results = []
-            for i, board in enumerate(board_list):
-                logits = policy_logits[i]  # Shape: (4096,)
-                value = float(values[i])
-                
-                # Determine if we need to flip (Black's perspective)
-                flip = (board.turn == chess.BLACK)
-                
-                # Create mask for legal moves (MASKED SOFTMAX)
-                legal_moves = list(board.legal_moves)
-                mask = torch.full((4096,), -float('inf'))
-                legal_indices = []
-                
-                for move in legal_moves:
-                    idx = self.move_to_index(move, flip=flip)
-                    if idx < 4096:
-                        mask[idx] = 0.0
-                        legal_indices.append(idx)
-                
-                # Apply mask and compute softmax only over legal moves
-                masked_logits = logits + mask
-                move_probs_tensor = torch.softmax(masked_logits, dim=0)
-                
-                # Extract probabilities for legal moves
-                legal_move_probs = []
-                for move in legal_moves:
-                    idx = self.move_to_index(move, flip=flip)
-                    if idx < 4096:
-                        legal_move_probs.append((move, float(move_probs_tensor[idx])))
-                    else:
-                        legal_move_probs.append((move, 1.0 / len(legal_moves)))
-                
-                # Normalize (should already be normalized, but just in case)
-                total_prob = sum(p for _, p in legal_move_probs)
-                if total_prob > 0 and abs(total_prob - 1.0) > 1e-6:
-                    legal_move_probs = [(m, p/total_prob) for m, p in legal_move_probs]
-                
-                results.append((legal_move_probs, value))
-            
-            return results
+        
+        results = []
+        for i, board in enumerate(board_list):
+            logits = policy_logits[i]
+            value = float(values[i])
+            flip = (board.turn == chess.BLACK)
+            legal_moves = list(board.legal_moves)
+            mask = torch.full((4096,), -float('inf'))
+            for move in legal_moves:
+                idx = self.move_to_index(move, flip=flip)
+                if idx < 4096:
+                    mask[idx] = 0.0
+            masked_logits = logits + mask
+            move_probs_tensor = torch.softmax(masked_logits, dim=0)
+            legal_move_probs = []
+            for move in legal_moves:
+                idx = self.move_to_index(move, flip=flip)
+                if idx < 4096:
+                    legal_move_probs.append((move, float(move_probs_tensor[idx])))
+                else:
+                    legal_move_probs.append((move, 1.0 / len(legal_moves)))
+            total_prob = sum(p for _, p in legal_move_probs)
+            if total_prob > 0 and abs(total_prob - 1.0) > 1e-6:
+                legal_move_probs = [(m, p/total_prob) for m, p in legal_move_probs]
+            results.append((legal_move_probs, value))
+        
+        return results
     
     def get_move_probabilities(self, board):
-        """Single position evaluation (uses batch function with size 1)."""
         results = self.evaluate_batch([board])
         return results[0] if results else ([], 0.0)
     
     # -------------------------
-    # Batched MCTS with FIXED virtual loss
+    # Batched MCTS
     # -------------------------
     def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False):
-        """
-        Run MCTS with batched neural network evaluation and CORRECT virtual loss.
-        """
         if simulations is None:
             simulations = self.mcts_simulations
         
         root = self.MCTSNode(root_board.copy(), parent=None, prior=0.0)
-        
-        # Expand root with network priors
         move_probs, value = self.get_move_probabilities(root.board)
         for move, prob in move_probs:
             child_board = root.board.copy()
             child_board.push(move)
             root.children[move] = self.MCTSNode(child_board, parent=root, prior=prob)
         
-        # Apply Dirichlet noise at root if requested
         if add_dirichlet_noise and len(root.children) > 0:
             eps = self.mcts_dirichlet_eps
             alpha = self.mcts_dirichlet_alpha
@@ -386,28 +353,21 @@ class ChessAI:
                 old_prior = root.children[m].prior
                 root.children[m].prior = (1 - eps) * old_prior + eps * noise[i]
         
-        # Run simulations in batches
         num_batches = (simulations + self.mcts_batch_size - 1) // self.mcts_batch_size
         
         for batch_idx in range(num_batches):
             batch_size = min(self.mcts_batch_size, simulations - batch_idx * self.mcts_batch_size)
-            
-            # Collect search paths for this batch
             search_paths = []
             leaf_nodes = []
             
             for _ in range(batch_size):
                 node = root
                 search_path = [node]
-                
-                # Selection: descend the tree
                 while len(node.children) > 0:
                     total_visits = sum(child.visits + child.virtual_loss_count 
                                       for child in node.children.values()) + 1
                     best_score = -1e9
                     best_move = None
-                    
-                    # PUCT score with corrected virtual loss
                     for move, child in node.children.items():
                         q = child.q_value
                         u = self.mcts_c_puct * child.prior * math.sqrt(total_visits) / (1 + child.visits + child.virtual_loss_count)
@@ -415,31 +375,21 @@ class ChessAI:
                         if score > best_score:
                             best_score = score
                             best_move = move
-                    
-                    # Guard against no best_move found
                     if best_move is None:
                         break
-                    
                     node = node.children[best_move]
-                    
-                    # Add virtual loss (increment counter, not actual visits)
                     node.virtual_loss_count += 1
-                    
                     search_path.append(node)
-                
                 search_paths.append(search_path)
                 leaf_nodes.append(node)
             
-            # Batch evaluate all leaf nodes at once
             boards_to_evaluate = []
             terminal_values = []
-            eval_index_map = []  # Map to track which leaf gets which eval result
+            eval_index_map = []
             
             for idx, node in enumerate(leaf_nodes):
                 if node.board.is_game_over():
                     res = node.board.result()
-                    # CRITICAL FIX: Evaluate from ROOT player's perspective
-                    # The root board's turn is who is doing the MCTS search
                     if res == "1-0":
                         value = 1.0 if root_board.turn == chess.WHITE else -1.0
                     elif res == "0-1":
@@ -452,60 +402,45 @@ class ChessAI:
                     terminal_values.append(None)
                     eval_index_map.append(idx)
             
-            # Single batched evaluation for all non-terminal positions
             if boards_to_evaluate:
                 eval_results = self.evaluate_batch(boards_to_evaluate)
             else:
                 eval_results = []
             
-            # Expand nodes and get values
             leaf_values = [None] * len(leaf_nodes)
             
             for eval_idx, node_idx in enumerate(eval_index_map):
                 node = leaf_nodes[node_idx]
                 mv_probs, leaf_value = eval_results[eval_idx]
                 leaf_values[node_idx] = leaf_value
-                
-                # Expand children
                 for move, prob in mv_probs:
                     if move not in node.children:
                         b = node.board.copy()
                         b.push(move)
                         node.children[move] = self.MCTSNode(b, parent=node, prior=prob)
             
-            # Fill in terminal values
             for idx, val in enumerate(terminal_values):
                 if val is not None:
                     leaf_values[idx] = val
             
-            # Backpropagate all paths with corrected virtual loss handling
             for search_path, leaf_value in zip(search_paths, leaf_values):
-                if leaf_value is None:  # Safety check
+                if leaf_value is None:
                     continue
-                    
                 value_to_propagate = leaf_value
                 for n in reversed(search_path):
                     n.visits += 1
                     n.value_sum += value_to_propagate
-                    
-                    # Remove virtual loss (decrement counter)
                     if n.virtual_loss_count > 0:
                         n.virtual_loss_count -= 1
-                    
                     value_to_propagate = -value_to_propagate
         
         return root
     
     # -------------------------
-    # Move selection (uses batched MCTS)
+    # Move selection
     # -------------------------
     def select_move(self, board, temperature=1.0, use_mcts=True, add_dirichlet_noise=False):
-        """
-        Select move using batched MCTS results.
-        Temperature=0 is allowed for deterministic play.
-        """
         if not use_mcts:
-            # fallback to policy sample
             move_probs, _ = self.get_move_probabilities(board)
             if not move_probs:
                 return None
@@ -520,36 +455,21 @@ class ChessAI:
             return np.random.choice(moves, p=probs)
         
         root = self.run_mcts_batched(board, simulations=self.mcts_simulations, add_dirichlet_noise=add_dirichlet_noise)
-        
         if not root.children:
             return None
-            
         moves = list(root.children.keys())
         visits = np.array([root.children[m].visits for m in moves], dtype=np.float64)
-        
         if temperature == 0 or temperature < 1e-8:
-            # Deterministic: pick most visited
             best_idx = int(np.argmax(visits))
             return moves[best_idx]
-        
-        # Temperature sampling from visit counts
         probs = visits ** (1.0 / temperature)
         probs = probs / probs.sum()
         return np.random.choice(moves, p=probs)
     
     # -------------------------
-    # Self-play / data collection with temperature schedule
+    # Self-play / data collection
     # -------------------------
-    def play_game(self, temperature=1.0, max_moves=200, temp_threshold=15):
-        """
-        Play a single self-play game using batched MCTS with temperature schedule.
-        
-        Temperature schedule (AlphaZero-style):
-        - Moves 1-temp_threshold: Use full temperature for exploration
-        - After temp_threshold: Use temperature=0 for best play
-        
-        This encourages opening diversity while playing optimally in endgames.
-        """
+    def play_game(self, temperature=1.0, max_moves=300, temp_threshold=15):
         board = chess.Board()
         game_data = []
         is_threefold = False
@@ -560,45 +480,41 @@ class ChessAI:
                 is_threefold = True
                 break
             
+            can_flip = self.is_position_symmetric_safe(board)
             board_tensor = self.board_to_tensor(board).cpu()
-            
-            # Temperature schedule: exploration early, exploitation later
             current_temp = temperature if move_count < temp_threshold else 0.0
-            
             move = self.select_move(board, temperature=current_temp, use_mcts=True, add_dirichlet_noise=True)
             
             if move is None:
                 break
             
-            # Store move index WITH flip if Black is moving
             flip = (board.turn == chess.BLACK)
             move_idx = self.move_to_index(move, flip=flip)
             player = board.turn
             
-            # Compute log prob for importance sampling
-            with torch.no_grad():
-                self.model.eval()
-                board_tensor_device = board_tensor.to(self.device)
-                if self.device.type == 'cuda':
-                    board_tensor_device = board_tensor_device.to(memory_format=torch.channels_last)
-                
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    policy_logits, _ = self.model(board_tensor_device)
-                
-                log_probs = F.log_softmax(policy_logits, dim=1)
-                if move_idx < log_probs.shape[1]:
-                    move_log_prob = log_probs[0, move_idx].item()
-                else:
-                    move_log_prob = -10.0
+            # Compute log prob — also uses the lock
+            board_tensor_device = board_tensor.to(self.device)
+            if self.device.type == 'cuda':
+                board_tensor_device = board_tensor_device.to(memory_format=torch.channels_last)
             
-            game_data.append((board_tensor, move_idx, player, move_log_prob))
+            with self.model_lock:
+                self.model.eval()
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                        policy_logits, _ = self.model(board_tensor_device)
+                    log_probs = F.log_softmax(policy_logits, dim=1)
+                    if move_idx < log_probs.shape[1]:
+                        move_log_prob = log_probs[0, move_idx].item()
+                    else:
+                        move_log_prob = -10.0
+            
+            game_data.append((board_tensor, move_idx, player, move_log_prob, can_flip))
             board.push(move)
             move_count += 1
             
             if len(game_data) > max_moves:
                 break
         
-        # Assign reward
         if is_threefold:
             reward = self.draw_penalty
             self.training_stats['draws'] += 1
@@ -620,45 +536,33 @@ class ChessAI:
         return game_data, reward, is_threefold
     
     # -------------------------
-    # Replay buffer (FIXED!)
+    # Replay buffer + SAFE AUGMENTATION
     # -------------------------
     def add_game_to_buffer(self, game_data, reward, is_draw=False):
-        """
-        Add game to replay buffer with CORRECT reward assignment.
-        
-        The reward is from the game's perspective (White wins = +1, Black wins = -1).
-        But we store the value from each player's perspective for training.
-        
-        Since board_tensor is already from the current player's perspective,
-        we need to assign rewards correctly:
-        - If I'm White and White won (reward=+1): target = +1 (good for me)
-        - If I'm Black and White won (reward=+1): target = -1 (bad for me)
-        - If I'm White and Black won (reward=-1): target = -1 (bad for me)
-        - If I'm Black and Black won (reward=-1): target = +1 (good for me)
-        
-        So the formula is: target = reward if player==WHITE else -reward
-        """
-        for board_tensor_cpu, move_idx, player, old_log_prob in game_data:
+        for board_tensor_cpu, move_idx, player, old_log_prob, can_flip in game_data:
             if move_idx is None:
                 continue
-            
             if is_draw:
                 target_value = self.draw_penalty
             else:
-                # Reward is from game perspective (White=+1, Black=-1)
-                # Convert to player perspective
                 if player == chess.WHITE:
-                    target_value = reward  # White wins = +1 is good, Black wins = -1 is bad
+                    target_value = reward
                 else:
-                    target_value = -reward  # White wins = +1 is bad, Black wins = -1 is good
+                    target_value = -reward
             
-            self.replay_buffer.append((
-                board_tensor_cpu,
-                move_idx,
-                target_value,
-                old_log_prob,
-                self.data_counter
-            ))
+            augmented = self.augment_tensor_and_index(board_tensor_cpu, move_idx, can_flip)
+            self.training_stats['positions_total'] += 1
+            if can_flip:
+                self.training_stats['positions_flipped'] += 1
+            
+            for aug_tensor, aug_move_idx in augmented:
+                self.replay_buffer.append((
+                    aug_tensor,
+                    aug_move_idx,
+                    target_value,
+                    old_log_prob,
+                    self.data_counter
+                ))
             self.data_counter += 1
     
     def clean_old_data(self):
@@ -675,82 +579,74 @@ class ChessAI:
     def sample_batch(self):
         if len(self.replay_buffer) == 0:
             raise ValueError("Replay buffer is empty")
-        
         batch = random.sample(self.replay_buffer, min(self.batch_size, len(self.replay_buffer)))
         if len(batch) < self.batch_size:
             batch = [random.choice(self.replay_buffer) for _ in range(self.batch_size)]
-        
         boards, move_idxs, target_values, old_log_probs, _ = zip(*batch)
         boards_tensor = torch.cat(boards, dim=0).to(self.device)
-        
-        # Use channels-last format
         if self.device.type == 'cuda':
             boards_tensor = boards_tensor.to(memory_format=torch.channels_last)
-        
         move_idxs_tensor = torch.LongTensor(move_idxs).to(self.device)
         target_values_tensor = torch.FloatTensor(target_values).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
-        
         return boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor
     
     # -------------------------
-    # Training with mixed precision
+    # Training — LOCK PROTECTED
     # -------------------------
     def train_on_batch(self, boards_tensor, move_idxs_tensor, target_values_tensor, old_log_probs_tensor):
-        self.model.train()
-        
-        # Mixed precision training
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
-            policy_logits, values = self.model(boards_tensor)
+        """
+        Runs one gradient update step.
+        Holds model_lock for the entire forward+backward pass so no inference
+        call (e.g. AI vs AI demo) can slip in and corrupt the autograd graph.
+        """
+        with self.model_lock:
+            self.model.train()
             
-            # Compute losses
-            log_probs = F.log_softmax(policy_logits, dim=1)
-            selected_log_probs = log_probs.gather(1, move_idxs_tensor.unsqueeze(1)).squeeze(1)
-            selected_log_probs = torch.clamp(selected_log_probs, min=-10.0, max=0.0)
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                policy_logits, values = self.model(boards_tensor)
+                
+                log_probs = F.log_softmax(policy_logits, dim=1)
+                selected_log_probs = log_probs.gather(1, move_idxs_tensor.unsqueeze(1)).squeeze(1)
+                selected_log_probs = torch.clamp(selected_log_probs, min=-10.0, max=0.0)
+                
+                ratio = torch.exp(selected_log_probs - old_log_probs_tensor)
+                ratio = torch.clamp(ratio, min=0.5, max=2.0)
+                
+                advantages = (target_values_tensor - values).detach()
+                adv_mean = advantages.mean()
+                adv_std = advantages.std(unbiased=False)
+                if adv_std.item() < 1e-6:
+                    advantages_norm = advantages - adv_mean
+                else:
+                    advantages_norm = (advantages - adv_mean) / (adv_std + 1e-8)
+                advantages_norm = torch.clamp(advantages_norm, -5.0, 5.0)
+                
+                policy_loss_raw = -(ratio * selected_log_probs * advantages_norm).mean()
+                policy_loss = torch.clamp(policy_loss_raw, -10.0, 10.0)
+                
+                value_loss = F.mse_loss(values, target_values_tensor)
+                
+                probs = F.softmax(policy_logits, dim=1)
+                entropy = -(probs * log_probs).sum(dim=1).mean()
+                adaptive_entropy_coef = self.entropy_coef * (1.0 + 0.1 / (1.0 + self.training_stats['total_training_steps'] / 1000.0))
+                
+                loss = policy_loss + self.value_coef * value_loss - adaptive_entropy_coef * entropy
             
-            # Importance sampling
-            ratio = torch.exp(selected_log_probs - old_log_probs_tensor)
-            ratio = torch.clamp(ratio, min=0.5, max=2.0)
+            if not torch.isfinite(loss):
+                return float('nan'), float('nan')
             
-            # Advantages
-            advantages = (target_values_tensor - values).detach()
-            adv_mean = advantages.mean()
-            adv_std = advantages.std(unbiased=False)
-            if adv_std.item() < 1e-6:
-                advantages_norm = advantages - adv_mean
+            self.optimizer.zero_grad()
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
             else:
-                advantages_norm = (advantages - adv_mean) / (adv_std + 1e-8)
-            advantages_norm = torch.clamp(advantages_norm, -5.0, 5.0)
-            
-            # Policy loss
-            policy_loss_raw = -(ratio * selected_log_probs * advantages_norm).mean()
-            policy_loss = torch.clamp(policy_loss_raw, -10.0, 10.0)
-            
-            # Value loss
-            value_loss = F.mse_loss(values, target_values_tensor)
-            
-            # Entropy
-            probs = F.softmax(policy_logits, dim=1)
-            entropy = -(probs * log_probs).sum(dim=1).mean()
-            adaptive_entropy_coef = self.entropy_coef * (1.0 + 0.1 / (1.0 + self.training_stats['total_training_steps'] / 1000.0))
-            
-            loss = policy_loss + self.value_coef * value_loss - adaptive_entropy_coef * entropy
-        
-        if not torch.isfinite(loss):
-            return float('nan'), float('nan')
-        
-        # Backward pass with gradient scaling
-        self.optimizer.zero_grad()
-        if self.use_amp:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
-            self.optimizer.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+                self.optimizer.step()
         
         try:
             self.loss_history.append(policy_loss.item())
@@ -759,21 +655,17 @@ class ChessAI:
         
         self.training_stats['total_training_steps'] += 1
         
+        try:
+            self.scheduler.step()
+        except Exception:
+            pass
+        
         return policy_loss.item(), value_loss.item()
     
     # -------------------------
     # Training loop
     # -------------------------
     def train(self, num_games=10, temperature=1.0, temp_threshold=15, callback=None):
-        """
-        Train with temperature schedule.
-        
-        Args:
-            num_games: Number of self-play games
-            temperature: Exploration temperature for first N moves
-            temp_threshold: Number of moves to use temperature (default 15)
-            callback: Progress callback function
-        """
         self.stop_training_flag = False
         
         for game_num in range(num_games):
@@ -790,7 +682,6 @@ class ChessAI:
             if game_num % 10 == 0:
                 self.clean_old_data()
             
-            # Training
             avg_policy_loss = 0.0
             avg_value_loss = 0.0
             steps_done = 0
@@ -804,7 +695,7 @@ class ChessAI:
                     except ValueError:
                         break
                     p_loss, v_loss = self.train_on_batch(boards, moves, values, log_probs)
-                    if p_loss != p_loss:  # NaN check
+                    if p_loss != p_loss:
                         continue
                     avg_policy_loss += p_loss
                     avg_value_loss += v_loss
@@ -830,19 +721,17 @@ class ChessAI:
     # -------------------------
     def save_model(self):
         model_path = os.path.join(self.save_dir, "model_latest.pth")
-        
         try:
             cpu_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
             save_dict = {
                 'model_state_dict': cpu_state,
                 'training_stats': self.training_stats,
-                'optimizer_state_dict': self.optimizer.state_dict()
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict()
             }
             if self.scaler:
                 save_dict['scaler_state_dict'] = self.scaler.state_dict()
-            
             torch.save(save_dict, model_path)
-            
             if self.training_stats['games_played'] % 50 == 0:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 backup_path = os.path.join(self.save_dir, f"model_{timestamp}.pth")
@@ -857,21 +746,21 @@ class ChessAI:
                 checkpoint = torch.load(model_path, map_location='cpu')
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.model.to(self.device)
-                
                 if self.device.type == 'cuda':
                     self.model = self.model.to(memory_format=torch.channels_last)
-                
                 self.training_stats = checkpoint.get('training_stats', self.training_stats)
-                
+                if 'positions_flipped' not in self.training_stats:
+                    self.training_stats['positions_flipped'] = 0
+                if 'positions_total' not in self.training_stats:
+                    self.training_stats['positions_total'] = 0
                 if 'optimizer_state_dict' in checkpoint:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                
                 if 'total_training_steps' not in self.training_stats:
                     self.training_stats['total_training_steps'] = 0
-                
                 print(f"Model loaded from {model_path}")
                 print(f"Stats: {self.training_stats}")
             except Exception as e:
@@ -881,12 +770,12 @@ class ChessAI:
 
 
 # -------------------------
-# GUI (unchanged)
+# GUI
 # -------------------------
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - FIXED (Symmetric Learning)")
+        self.window.title("Chess AI - FIXED + SAFE AUGMENTATION + LR SCHEDULER")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -946,7 +835,7 @@ class ChessGUI:
         self.temp_threshold_var = tk.StringVar(value="15")
         ttk.Entry(train_frame, textvariable=self.temp_threshold_var, width=15).grid(row=2, column=1, pady=5, padx=5)
         
-        ttk.Label(train_frame, text="(Explore first N moves, then greedy)", 
+        ttk.Label(train_frame, text="(Explore first N moves, then greedy)",
                  font=('Arial', 8), foreground='gray').grid(row=2, column=2, sticky=tk.W, padx=5)
         
         button_frame = ttk.Frame(train_frame)
@@ -964,29 +853,59 @@ class ChessGUI:
         play_frame = ttk.LabelFrame(right_frame, text="Play Controls", padding="10")
         play_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
         
-        ttk.Button(play_frame, text="Play as White", command=lambda: self.start_game(chess.WHITE), width=20).grid(row=0, column=0, pady=5)
-        ttk.Button(play_frame, text="Play as Black", command=lambda: self.start_game(chess.BLACK), width=20).grid(row=1, column=0, pady=5)
-        ttk.Button(play_frame, text="AI vs AI Demo", command=self.watch_ai_game, width=20).grid(row=2, column=0, pady=5)
-        ttk.Button(play_frame, text="New Game", command=self.reset_game, width=20).grid(row=3, column=0, pady=5)
+        # Keep references so we can disable/enable during training
+        self.btn_play_white = ttk.Button(play_frame, text="Play as White",
+                                         command=lambda: self.start_game(chess.WHITE), width=20)
+        self.btn_play_white.grid(row=0, column=0, pady=5)
         
-        ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var, command=self.on_flip_toggle).grid(row=4, column=0, pady=5)
+        self.btn_play_black = ttk.Button(play_frame, text="Play as Black",
+                                         command=lambda: self.start_game(chess.BLACK), width=20)
+        self.btn_play_black.grid(row=1, column=0, pady=5)
+        
+        self.btn_ai_vs_ai = ttk.Button(play_frame, text="AI vs AI Demo",
+                                        command=self.watch_ai_game, width=20)
+        self.btn_ai_vs_ai.grid(row=2, column=0, pady=5)
+        
+        self.btn_new_game = ttk.Button(play_frame, text="New Game",
+                                        command=self.reset_game, width=20)
+        self.btn_new_game.grid(row=3, column=0, pady=5)
+        
+        ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var,
+                        command=self.on_flip_toggle).grid(row=4, column=0, pady=5)
+
+        # Training-active notice shown when play buttons are disabled
+        self.training_notice_var = tk.StringVar(value="")
+        ttk.Label(play_frame, textvariable=self.training_notice_var,
+                  foreground="orange", font=('Arial', 8)).grid(row=5, column=0, pady=2)
         
         stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding="10")
         stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
-        self.stats_text = tk.Text(stats_frame, height=12, width=35, wrap=tk.WORD)
+        self.stats_text = tk.Text(stats_frame, height=14, width=35, wrap=tk.WORD)
         self.stats_text.grid(row=0, column=0)
         
         amp_status = "AMP: ON" if self.ai.use_amp else "AMP: OFF"
         ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=1, column=0, pady=2)
         ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=2, column=0, pady=2)
-        ttk.Label(stats_frame, text="🎯 FIXED VERSION - Black can win!", foreground="red", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
+        ttk.Label(stats_frame, text="✅ THREAD-SAFE + AUGMENTATION + LR SCHEDULER",
+                  foreground="purple", font=('Arial', 9, 'bold')).grid(row=3, column=0, pady=2)
         
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN,
+                  anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         self.update_board_display()
         self.update_stats_display()
+
+    def _set_play_buttons_state(self, state):
+        """Enable or disable play buttons (call with tk.NORMAL or tk.DISABLED)."""
+        for btn in (self.btn_play_white, self.btn_play_black,
+                    self.btn_ai_vs_ai, self.btn_new_game):
+            btn.config(state=state)
+        if state == tk.DISABLED:
+            self.training_notice_var.set("Stop training to play")
+        else:
+            self.training_notice_var.set("")
     
     def on_flip_toggle(self):
         self.flip_board = bool(self.flip_var.get())
@@ -1023,12 +942,9 @@ class ChessGUI:
                 else:
                     x1 = (7 - file) * self.square_size + offset
                     y1 = rank * self.square_size + offset
-                
                 x2 = x1 + self.square_size
                 y2 = y1 + self.square_size
-                
                 square = chess.square(file, rank)
-                
                 if square == self.selected_square:
                     color = selected_color
                 elif square in [move.to_square for move in self.legal_moves_for_selected]:
@@ -1037,12 +953,10 @@ class ChessGUI:
                     color = light_square
                 else:
                     color = dark_square
-                
                 draw.rectangle([x1, y1, x2, y2], fill=color, outline='gray')
         
         files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
         ranks = ['1', '2', '3', '4', '5', '6', '7', '8']
-        
         if self.flip_board:
             files = list(reversed(files))
             ranks = list(reversed(ranks))
@@ -1069,21 +983,17 @@ class ChessGUI:
             for file in range(8):
                 square = chess.square(file, rank)
                 piece = self.board.piece_at(square)
-                
                 if piece:
                     symbol = piece.symbol()
                     piece_char = piece_symbols.get(symbol, symbol)
-                    
                     if not self.flip_board:
                         x = file * self.square_size + self.square_size // 2 + offset
                         y = (7 - rank) * self.square_size + self.square_size // 2 + offset
                     else:
                         x = (7 - file) * self.square_size + self.square_size // 2 + offset
                         y = rank * self.square_size + self.square_size // 2 + offset
-                    
                     piece_color = 'white' if piece.color == chess.WHITE else 'black'
                     outline_color = 'black' if piece.color == chess.WHITE else 'white'
-                    
                     for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
                         draw.text((x + dx, y + dy), piece_char, fill=outline_color, font=piece_font, anchor='mm')
                     draw.text((x, y), piece_char, fill=piece_color, font=piece_font, anchor='mm')
@@ -1103,6 +1013,8 @@ class ChessGUI:
         win_rate_white = (stats['white_wins'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
         win_rate_black = (stats['black_wins'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
         draw_rate = (stats['draws'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
+        flip_rate = (stats['positions_flipped'] / stats['positions_total'] * 100) if stats['positions_total'] > 0 else 0
+        current_lr = self.ai.optimizer.param_groups[0]['lr']
         
         stats_text = f"""Games: {stats['games_played']}
 Moves: {stats['total_moves']}
@@ -1113,6 +1025,8 @@ Black: {stats['black_wins']} ({win_rate_black:.1f}%)
 Draws: {stats['draws']} ({draw_rate:.1f}%)
 
 Buffer: {len(self.ai.replay_buffer)}
+Augmentation: {flip_rate:.1f}% flipped
+LR: {current_lr:.2e}
 Model: {self.ai.save_dir}
         """.strip()
         
@@ -1136,22 +1050,17 @@ Model: {self.ai.save_dir}
     def on_board_click(self, event):
         if self.human_color is None or self.board.turn != self.human_color or self.board.is_game_over() or self.ai_thinking:
             return
-        
         offset = 20
         x, y = event.x - offset, event.y - offset
         if x < 0 or y < 0 or x >= self.square_size * 8 or y >= self.square_size * 8:
             return
-        
         col = int(min(7, max(0, x // self.square_size)))
         row = int(min(7, max(0, y // self.square_size)))
-        
         if not self.flip_board:
             file, rank = col, 7 - row
         else:
             file, rank = 7 - col, row
-        
         square = chess.square(file, rank)
-        
         if self.selected_square is None:
             piece = self.board.piece_at(square)
             if piece and piece.color == self.human_color:
@@ -1166,7 +1075,6 @@ Model: {self.ai.save_dir}
                 move = chess.Move(self.selected_square, square, promotion=promo)
             else:
                 move = chess.Move(self.selected_square, square)
-            
             if move in self.board.legal_moves:
                 self.make_move(move)
                 self.selected_square = None
@@ -1188,13 +1096,11 @@ Model: {self.ai.save_dir}
         dlg.transient(self.window)
         dlg.grab_set()
         choice = {'piece': None}
-        
         ttk.Label(dlg, text="Promote to:", padding=10).grid(row=0, column=0, columnspan=4)
-        ttk.Button(dlg, text="♕", width=8, command=lambda: [setattr(choice, 'piece', chess.QUEEN), dlg.destroy()]).grid(row=1, column=0, padx=5, pady=5)
-        ttk.Button(dlg, text="♖", width=8, command=lambda: [setattr(choice, 'piece', chess.ROOK), dlg.destroy()]).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(dlg, text="♗", width=8, command=lambda: [setattr(choice, 'piece', chess.BISHOP), dlg.destroy()]).grid(row=1, column=2, padx=5, pady=5)
-        ttk.Button(dlg, text="♘", width=8, command=lambda: [setattr(choice, 'piece', chess.KNIGHT), dlg.destroy()]).grid(row=1, column=3, padx=5, pady=5)
-        
+        ttk.Button(dlg, text="♕", width=8, command=lambda: [choice.update({'piece': chess.QUEEN}), dlg.destroy()]).grid(row=1, column=0, padx=5, pady=5)
+        ttk.Button(dlg, text="♖", width=8, command=lambda: [choice.update({'piece': chess.ROOK}), dlg.destroy()]).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(dlg, text="♗", width=8, command=lambda: [choice.update({'piece': chess.BISHOP}), dlg.destroy()]).grid(row=1, column=2, padx=5, pady=5)
+        ttk.Button(dlg, text="♘", width=8, command=lambda: [choice.update({'piece': chess.KNIGHT}), dlg.destroy()]).grid(row=1, column=3, padx=5, pady=5)
         dlg.wait_window()
         return choice['piece']
     
@@ -1208,11 +1114,9 @@ Model: {self.ai.save_dir}
         if self.board.is_game_over() or self.board.can_claim_threefold_repetition():
             self.game_over()
             return
-        
         self.ai_thinking = True
         self.status_var.set("AI thinking...")
         self.window.update()
-        
         try:
             move = self.ai.select_move(self.board, temperature=0.0, use_mcts=True, add_dirichlet_noise=False)
             if move:
@@ -1291,7 +1195,6 @@ Model: {self.ai.save_dir}
                 msg = "Black wins"
             else:
                 msg = "Draw"
-        
         self.status_var.set(f"Game Over: {msg}")
         messagebox.showinfo("Game Over", msg)
     
@@ -1328,7 +1231,6 @@ Model: {self.ai.save_dir}
         if self.is_training:
             messagebox.showwarning("Warning", "Already training")
             return
-        
         try:
             num = int(self.num_games_var.get())
             temp = float(self.temperature_var.get())
@@ -1342,8 +1244,10 @@ Model: {self.ai.save_dir}
         self.is_training = True
         self.train_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        self._set_play_buttons_state(tk.DISABLED)  # prevent race condition
         self.progress_var.set(f"Starting... (Temp={temp}, Switch@move {temp_threshold})")
-        self.training_thread = threading.Thread(target=self.train_worker, args=(num, temp, temp_threshold), daemon=True)
+        self.training_thread = threading.Thread(
+            target=self.train_worker, args=(num, temp, temp_threshold), daemon=True)
         self.training_thread.start()
     
     def stop_training(self):
@@ -1357,6 +1261,7 @@ Model: {self.ai.save_dir}
         self.is_training = False
         self.train_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+        self._set_play_buttons_state(tk.NORMAL)  # re-enable play buttons
         self.ai.save_model()
         self.update_stats_display()
         self.status_var.set("Ready")
