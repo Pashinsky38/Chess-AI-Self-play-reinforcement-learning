@@ -162,7 +162,7 @@ class ChessAI:
                  max_data_age=2000,
                  draw_penalty=-0.3,
                  repetition_penalty=-0.15,
-                 mcts_simulations=64,
+                 mcts_simulations=128, # Change accordingly
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
