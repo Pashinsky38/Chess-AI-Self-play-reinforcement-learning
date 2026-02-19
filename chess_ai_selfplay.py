@@ -125,7 +125,7 @@ class ChessAI:
                  max_data_age=2000,
                  draw_penalty=-0.3,          # FIX: was 0.0 — draws now cost something
                  repetition_penalty=-0.15,   # FIX: per-position penalty applied inline
-                 mcts_simulations=256,
+                 mcts_simulations=64,        # 64 for now, increase when there is much more data and stable training
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
