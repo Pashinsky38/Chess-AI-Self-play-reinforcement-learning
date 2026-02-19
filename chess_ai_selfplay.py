@@ -29,6 +29,15 @@ DRAW COLLAPSE FIXES:
     into the VALUE TARGET, not just end-of-game reward
 - ✅ Games continue through repetitions (no early exit) - model must escape or suffer
 - ✅ temp_threshold raised to 30: Keeps exploration alive deeper into games
+
+MCTS IMPROVEMENTS (NEW):
+- ✅ TREE REUSE: Subtree is preserved between moves, giving free extra simulations
+- ✅ FPU (First Play Urgency): Unvisited nodes get parent_Q - fpu_reduction instead of 0,
+    steering search toward branches the network already considers promising
+- ✅ PUCT perspective fix: Backup value is now relative to the leaf node's turn,
+    not the root's turn — prevents systematic over/under-estimation
+- ✅ Cleaner virtual loss: visits and virtual_loss are kept separate in UCB formula
+    for correct exploration accounting
 """
 
 import chess
@@ -96,6 +105,9 @@ class ChessNet(nn.Module):
 # -------------------------
 class ChessAI:
     class MCTSNode:
+        __slots__ = ('board', 'parent', 'prior', 'children', 'visits',
+                     'value_sum', 'virtual_loss_count', 'turn')
+
         def __init__(self, board, parent=None, prior=0.0):
             self.board = board
             self.parent = parent
@@ -104,13 +116,14 @@ class ChessAI:
             self.visits = 0
             self.value_sum = 0.0
             self.virtual_loss_count = 0
+            # Track whose turn it is at this node for correct backup perspective
+            self.turn = board.turn
 
         @property
         def q_value(self):
-            total_visits = self.visits + self.virtual_loss_count
-            if total_visits == 0:
+            if self.visits == 0:
                 return 0.0
-            return self.value_sum / total_visits
+            return self.value_sum / self.visits
 
     def __init__(self, save_dir="chess_ai_models",
                  replay_capacity=30000,
@@ -123,13 +136,14 @@ class ChessAI:
                  lr=1e-4,
                  weight_decay=1e-4,
                  max_data_age=2000,
-                 draw_penalty=-0.3,          # FIX: was 0.0 — draws now cost something
-                 repetition_penalty=-0.15,   # FIX: per-position penalty applied inline
-                 mcts_simulations=64,        # 64 for now, increase when there is much more data and stable training
+                 draw_penalty=-0.3,
+                 repetition_penalty=-0.15,
+                 mcts_simulations=64,
                  mcts_batch_size=8,
                  mcts_c_puct=1.4,
                  mcts_dirichlet_eps=0.25,
                  mcts_dirichlet_alpha=0.3,
+                 mcts_fpu_reduction=0.2,     # NEW: First Play Urgency reduction
                  use_amp=True):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,12 +199,25 @@ class ChessAI:
         self.mcts_c_puct = mcts_c_puct
         self.mcts_dirichlet_eps = mcts_dirichlet_eps
         self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
+        self.mcts_fpu_reduction = mcts_fpu_reduction   # NEW
+
+        # ---------------------------------------------------------------
+        # IMPROVEMENT 1: Tree reuse cache
+        # The last MCTS root is stored here. When select_move is called
+        # again, we find the matching child and reuse its statistics,
+        # effectively getting N extra free simulations per move.
+        # ---------------------------------------------------------------
+        self._mcts_root_cache = None   # (board_fen, MCTSNode)
         
         self.data_counter = 0
         self.loss_history = deque(maxlen=100)
         
         os.makedirs(save_dir, exist_ok=True)
         self.load_model()
+
+    def reset_mcts_tree(self):
+        """Call at the start of each game to discard stale cached trees."""
+        self._mcts_root_cache = None
     
     # -------------------------
     # Board / move helpers
@@ -317,30 +344,85 @@ class ChessAI:
     def get_move_probabilities(self, board):
         results = self.evaluate_batch([board])
         return results[0] if results else ([], 0.0)
-    
-    # -------------------------
-    # Batched MCTS
-    # -------------------------
-    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False, game_position_counts=None):
-        """
-        Run MCTS with batched neural network evaluation and CORRECT virtual loss.
 
-        game_position_counts: dict of {board_fen: visit_count} from the current game.
-        Leaf nodes whose position has already been seen in the real game get their
-        value penalized directly, so MCTS steers away from repetition during search.
+    # ---------------------------------------------------------------
+    # IMPROVEMENT 2: Tree reuse helper
+    # Tries to find a cached subtree matching the current board state.
+    # If the board was reached via a known move from the cached root,
+    # we return the child node (with all its accumulated statistics)
+    # instead of starting a brand-new root.
+    # ---------------------------------------------------------------
+    def _get_reusable_root(self, board):
+        """
+        Return (reused_node, is_reused).
+        Looks up the cached root and finds the child whose board FEN
+        matches the current board. If found, detaches it from its
+        parent to free memory and returns it as the new root.
+        """
+        if self._mcts_root_cache is None:
+            return None, False
+
+        cached_root = self._mcts_root_cache
+        target_fen = board.fen()
+
+        # Check one ply deep (the most common case)
+        for move, child in cached_root.children.items():
+            if child.board.fen() == target_fen:
+                child.parent = None   # detach — don't keep whole old tree in memory
+                return child, True
+
+        # Check two plies deep (both sides have moved since last call)
+        for _, child in cached_root.children.items():
+            for move2, grandchild in child.children.items():
+                if grandchild.board.fen() == target_fen:
+                    grandchild.parent = None
+                    return grandchild, True
+
+        return None, False
+
+    # -------------------------
+    # Batched MCTS (improved)
+    # -------------------------
+    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False,
+                         game_position_counts=None, reuse_tree=True):
+        """
+        Run MCTS with:
+        - Batched neural network evaluation
+        - IMPROVEMENT 1: Tree reuse (reuse_tree=True)
+        - IMPROVEMENT 2: FPU — unvisited children use parent_Q - fpu_reduction
+        - IMPROVEMENT 3: Correct backup perspective (relative to each node's turn)
+        - Correct virtual-loss bookkeeping
         """
         if simulations is None:
             simulations = self.mcts_simulations
         if game_position_counts is None:
             game_position_counts = {}
-        
-        root = self.MCTSNode(root_board.copy(), parent=None, prior=0.0)
-        move_probs, value = self.get_move_probabilities(root.board)
-        for move, prob in move_probs:
-            child_board = root.board.copy()
-            child_board.push(move)
-            root.children[move] = self.MCTSNode(child_board, parent=root, prior=prob)
-        
+
+        # --- TREE REUSE: try to recover an existing subtree ---
+        reused_root = None
+        if reuse_tree:
+            reused_root, was_reused = self._get_reusable_root(root_board)
+
+        if reused_root is not None:
+            root = reused_root
+            # Refresh board reference (it may be stale after detach)
+            root.board = root_board.copy()
+            # If the reused root has no children yet, expand it
+            if not root.children:
+                move_probs, _ = self.get_move_probabilities(root.board)
+                for move, prob in move_probs:
+                    child_board = root.board.copy()
+                    child_board.push(move)
+                    root.children[move] = self.MCTSNode(child_board, parent=root, prior=prob)
+        else:
+            root = self.MCTSNode(root_board.copy(), parent=None, prior=0.0)
+            move_probs, value = self.get_move_probabilities(root.board)
+            for move, prob in move_probs:
+                child_board = root.board.copy()
+                child_board.push(move)
+                root.children[move] = self.MCTSNode(child_board, parent=root, prior=prob)
+
+        # --- Dirichlet noise at root for training exploration ---
         if add_dirichlet_noise and len(root.children) > 0:
             eps = self.mcts_dirichlet_eps
             alpha = self.mcts_dirichlet_alpha
@@ -349,68 +431,98 @@ class ChessAI:
             for i, m in enumerate(moves):
                 old_prior = root.children[m].prior
                 root.children[m].prior = (1 - eps) * old_prior + eps * noise[i]
-        
+
         num_batches = (simulations + self.mcts_batch_size - 1) // self.mcts_batch_size
-        
+
         for batch_idx in range(num_batches):
-            batch_size = min(self.mcts_batch_size, simulations - batch_idx * self.mcts_batch_size)
+            batch_size = min(self.mcts_batch_size,
+                             simulations - batch_idx * self.mcts_batch_size)
             search_paths = []
             leaf_nodes = []
-            
+
             for _ in range(batch_size):
                 node = root
                 search_path = [node]
+
                 while len(node.children) > 0:
-                    total_visits = sum(child.visits + child.virtual_loss_count
-                                      for child in node.children.values()) + 1
+                    # ---------------------------------------------------
+                    # IMPROVEMENT 2: FPU in child selection
+                    # Unvisited children are initialized with a pessimistic
+                    # Q estimate: parent_Q - fpu_reduction, rather than 0.
+                    # This prevents the search from blindly rushing to
+                    # unvisited leaves before confirming the parent is good.
+                    # ---------------------------------------------------
+                    parent_q = node.q_value
+                    # Total visits across all children (for PUCT denominator)
+                    total_child_visits = sum(
+                        c.visits + c.virtual_loss_count
+                        for c in node.children.values()
+                    ) + 1
+
                     best_score = -1e9
                     best_move = None
+
                     for move, child in node.children.items():
-                        q = child.q_value
-                        u = self.mcts_c_puct * child.prior * math.sqrt(total_visits) / (1 + child.visits + child.virtual_loss_count)
+                        # FPU: if never visited, use pessimistic prior
+                        if child.visits == 0:
+                            q = parent_q - self.mcts_fpu_reduction
+                        else:
+                            # IMPROVEMENT 3 (partial): use only real visits in Q
+                            q = child.value_sum / child.visits
+
+                        # PUCT: exploration bonus — virtual loss in denominator
+                        # so that parallel paths don't pile onto same node
+                        u = (self.mcts_c_puct * child.prior
+                             * math.sqrt(total_child_visits)
+                             / (1 + child.visits + child.virtual_loss_count))
+
                         score = q + u
                         if score > best_score:
                             best_score = score
                             best_move = move
+
                     if best_move is None:
                         break
                     node = node.children[best_move]
                     node.virtual_loss_count += 1
                     search_path.append(node)
+
                 search_paths.append(search_path)
                 leaf_nodes.append(node)
-            
+
             boards_to_evaluate = []
             terminal_values = []
             eval_index_map = []
-            
+
             for idx, node in enumerate(leaf_nodes):
                 if node.board.is_game_over():
                     res = node.board.result()
                     if res == "1-0":
-                        value = 1.0 if root_board.turn == chess.WHITE else -1.0
+                        raw = 1.0
                     elif res == "0-1":
-                        value = -1.0 if root_board.turn == chess.WHITE else 1.0
+                        raw = -1.0
                     else:
-                        value = self.draw_penalty
-                    terminal_values.append(value)
+                        raw = self.draw_penalty
+                    # Express value in terms of root_board's turn
+                    if node.turn != root_board.turn:
+                        raw = -raw
+                    terminal_values.append(raw)
                 else:
                     boards_to_evaluate.append(node.board)
                     terminal_values.append(None)
                     eval_index_map.append(idx)
-            
+
             if boards_to_evaluate:
                 eval_results = self.evaluate_batch(boards_to_evaluate)
             else:
                 eval_results = []
-            
+
             leaf_values = [None] * len(leaf_nodes)
             for eval_idx, node_idx in enumerate(eval_index_map):
                 node = leaf_nodes[node_idx]
                 mv_probs, leaf_value = eval_results[eval_idx]
 
-                # Apply repetition penalty if this leaf position was already seen in the game.
-                # Penalty scales with how many times it has been visited, same as play_game.
+                # Repetition penalty
                 leaf_fen = node.board.board_fen()
                 prior_visits = game_position_counts.get(leaf_fen, 0)
                 if prior_visits >= 1:
@@ -418,17 +530,30 @@ class ChessAI:
                         leaf_value + self.repetition_penalty * prior_visits, -1.0, 1.0
                     ))
 
+                # -------------------------------------------------------
+                # IMPROVEMENT 3: Backup perspective fix
+                # The network always returns value from the current node's
+                # perspective. We convert to root perspective here once,
+                # so the backup loop can simply negate at each edge.
+                # -------------------------------------------------------
+                if node.turn != root_board.turn:
+                    leaf_value = -leaf_value
+
                 leaf_values[node_idx] = leaf_value
+
                 for move, prob in mv_probs:
                     if move not in node.children:
                         b = node.board.copy()
                         b.push(move)
                         node.children[move] = self.MCTSNode(b, parent=node, prior=prob)
-            
+
             for idx, val in enumerate(terminal_values):
                 if val is not None:
                     leaf_values[idx] = val
-            
+
+            # -----------------------------------------------------------
+            # Backup: value is in root's perspective; negate at each edge
+            # -----------------------------------------------------------
             for search_path, leaf_value in zip(search_paths, leaf_values):
                 if leaf_value is None:
                     continue
@@ -439,13 +564,16 @@ class ChessAI:
                     if n.virtual_loss_count > 0:
                         n.virtual_loss_count -= 1
                     value_to_propagate = -value_to_propagate
-        
+
+        # Cache root for reuse on the next call
+        self._mcts_root_cache = root
         return root
     
     # -------------------------
     # Move selection
     # -------------------------
-    def select_move(self, board, temperature=1.0, use_mcts=True, add_dirichlet_noise=False, game_position_counts=None):
+    def select_move(self, board, temperature=1.0, use_mcts=True,
+                    add_dirichlet_noise=False, game_position_counts=None):
         if not use_mcts:
             move_probs, _ = self.get_move_probabilities(board)
             if not move_probs:
@@ -459,10 +587,14 @@ class ChessAI:
                 probs = probs ** (1.0 / temperature)
             probs = probs / probs.sum()
             return np.random.choice(moves, p=probs)
-        
-        root = self.run_mcts_batched(board, simulations=self.mcts_simulations,
-                                     add_dirichlet_noise=add_dirichlet_noise,
-                                     game_position_counts=game_position_counts)
+
+        root = self.run_mcts_batched(
+            board,
+            simulations=self.mcts_simulations,
+            add_dirichlet_noise=add_dirichlet_noise,
+            game_position_counts=game_position_counts,
+            reuse_tree=True          # always try to reuse during play
+        )
         if not root.children:
             return None
         moves = list(root.children.keys())
@@ -475,35 +607,22 @@ class ChessAI:
         return np.random.choice(moves, p=probs)
     
     # -------------------------
-    # Self-play with inline repetition penalty (NEW!)
+    # Self-play with inline repetition penalty
     # -------------------------
     def play_game(self, temperature=1.0, max_moves=300, temp_threshold=30):
-        """
-        Play a self-play game with inline repetition penalty.
-
-        KEY CHANGE: We no longer exit early on threefold repetition.
-        Instead, whenever a position is visited for the 2nd+ time,
-        we record a penalty directly in the VALUE TARGET for that step.
-        The game only ends via the normal chess rules (game over) or max_moves.
-
-        This means the model must ESCAPE repetition loops or keep paying a tax,
-        rather than exploiting them as a free shortcut to a 0-reward draw.
-        """
         board = chess.Board()
         game_data = []
         move_count = 0
-
-        # Track how many times each board position (by FEN) has been seen
         position_counts = {}
+
+        # Reset tree cache at game start so we don't carry stale data
+        self.reset_mcts_tree()
 
         while not board.is_game_over() and not self.stop_training_flag:
             fen_key = board.board_fen()
             visit_count = position_counts.get(fen_key, 0)
             position_counts[fen_key] = visit_count + 1
 
-            # Compute inline repetition penalty for this step:
-            # 0 on first visit, repetition_penalty on 2nd+ visit
-            # Scale penalty up with each additional repeat (-0.15, -0.30, -0.45...)
             if visit_count >= 1:
                 inline_penalty = self.repetition_penalty * visit_count
                 self.training_stats['repetition_penalties_applied'] += 1
@@ -538,7 +657,6 @@ class ChessAI:
                 else:
                     move_log_prob = -10.0
 
-            # Store inline_penalty alongside data so add_game_to_buffer can apply it
             game_data.append((board_tensor, move_idx, player, move_log_prob, can_flip, inline_penalty))
             board.push(move)
             move_count += 1
@@ -546,7 +664,6 @@ class ChessAI:
             if len(game_data) > max_moves:
                 break
 
-        # Assign end-of-game reward
         result = board.result()
         if result == "1-0":
             reward = 1.0
@@ -561,39 +678,26 @@ class ChessAI:
         self.training_stats['games_played'] += 1
         self.training_stats['total_moves'] += len(game_data)
 
+        # Clear tree cache after game ends — don't leak memory between games
+        self.reset_mcts_tree()
         return game_data, reward
 
     # -------------------------
-    # Replay buffer with inline repetition penalty applied to value target
+    # Replay buffer
     # -------------------------
     def add_game_to_buffer(self, game_data, reward):
-        """
-        Add game to replay buffer.
-
-        VALUE TARGET = game_outcome (from player's perspective)
-                     + inline_penalty (already negative for repeated positions)
-
-        The inline penalty is clamped so it can't flip the sign past -1.
-        """
         for board_tensor_cpu, move_idx, player, old_log_prob, can_flip, inline_penalty in game_data:
             if move_idx is None:
                 continue
-
-            # Convert game outcome to this player's perspective
             if player == chess.WHITE:
                 base_value = reward
             else:
                 base_value = -reward
-
-            # Apply inline repetition penalty and clamp to valid range
             target_value = float(np.clip(base_value + inline_penalty, -1.0, 1.0))
-
             augmented = self.augment_tensor_and_index(board_tensor_cpu, move_idx, can_flip)
-
             self.training_stats['positions_total'] += 1
             if can_flip:
                 self.training_stats['positions_flipped'] += 1
-
             for aug_tensor, aug_move_idx in augmented:
                 self.replay_buffer.append((
                     aug_tensor,
@@ -602,7 +706,6 @@ class ChessAI:
                     old_log_prob,
                     self.data_counter
                 ))
-
             self.data_counter += 1
     
     def clean_old_data(self):
@@ -770,7 +873,6 @@ class ChessAI:
                 if self.device.type == 'cuda':
                     self.model = self.model.to(memory_format=torch.channels_last)
                 self.training_stats = checkpoint.get('training_stats', self.training_stats)
-                # Backwards compatibility
                 for key in ['positions_flipped', 'positions_total', 'total_training_steps', 'repetition_penalties_applied']:
                     if key not in self.training_stats:
                         self.training_stats[key] = 0
@@ -794,7 +896,7 @@ class ChessAI:
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI - Draw Collapse Fix")
+        self.window.title("Chess AI - Draw Collapse Fix + MCTS Improvements")
         self.window.geometry("1000x800")
         
         self.ai = ChessAI()
@@ -892,6 +994,7 @@ class ChessGUI:
         ttk.Label(stats_frame, text=f"Device: {self.ai.device}", foreground="blue").grid(row=2, column=0, pady=2)
         ttk.Label(stats_frame, text=amp_status, foreground="green").grid(row=3, column=0, pady=2)
         ttk.Label(stats_frame, text="✅ DRAW COLLAPSE FIX ACTIVE", foreground="red", font=('Arial', 9, 'bold')).grid(row=4, column=0, pady=2)
+        ttk.Label(stats_frame, text="✅ MCTS: Tree Reuse + FPU", foreground="purple", font=('Arial', 9, 'bold')).grid(row=5, column=0, pady=2)
         
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
@@ -1023,6 +1126,7 @@ Rep.penalties: {rep_penalties}
 LR: {current_lr:.2e}
 Draw penalty: {self.ai.draw_penalty}
 Rep penalty: {self.ai.repetition_penalty}
+FPU reduction: {self.ai.mcts_fpu_reduction}
 Model: {self.ai.save_dir}""".strip()
         
         self.stats_text.delete(1.0, tk.END)
@@ -1113,6 +1217,9 @@ Model: {self.ai.save_dir}""".strip()
         self.status_var.set("AI thinking...")
         self.window.update()
         try:
+            # Reset tree before human vs AI games — the human's move
+            # was not seen by the AI's cached tree
+            self.ai.reset_mcts_tree()
             move = self.ai.select_move(self.board, temperature=0.0, use_mcts=True, add_dirichlet_noise=False)
             if move:
                 self.make_move(move)
@@ -1134,6 +1241,7 @@ Model: {self.ai.save_dir}""".strip()
         self.ai_thinking = False
         self.flip_board = (color == chess.BLACK)
         self.flip_var.set(self.flip_board)
+        self.ai.reset_mcts_tree()
         self.update_board_display()
         self.update_move_history()
         self.status_var.set(f"You are {'White' if color == chess.WHITE else 'Black'}")
@@ -1150,6 +1258,7 @@ Model: {self.ai.save_dir}""".strip()
         self.flip_var.set(False)
         self.ai_vs_ai_running = True
         self.ai_vs_ai_paused = False
+        self.ai.reset_mcts_tree()
         self.pause_button.config(text="Pause", state=tk.NORMAL)
         self.update_board_display()
         self.update_move_history()
@@ -1159,11 +1268,11 @@ Model: {self.ai.save_dir}""".strip()
         if not self.ai_vs_ai_running:
             return
         if self.ai_vs_ai_paused:
-            # Check again in 200ms without making a move
             self.window.after(200, self.play_ai_vs_ai)
             return
         if not self.board.is_game_over():
             try:
+                # Tree reuse is active across AI vs AI moves
                 move = self.ai.select_move(self.board, temperature=0.1, use_mcts=True)
                 if move:
                     self.make_move(move)
@@ -1179,7 +1288,6 @@ Model: {self.ai.save_dir}""".strip()
             self.game_over()
     
     def reset_game(self):
-        # Stop any running AI vs AI game first
         self.ai_vs_ai_running = False
         self.ai_vs_ai_paused = False
         self.pause_button.config(text="Pause", state=tk.DISABLED)
@@ -1190,6 +1298,7 @@ Model: {self.ai.save_dir}""".strip()
         self.move_history = []
         self.flip_board = False
         self.flip_var.set(False)
+        self.ai.reset_mcts_tree()
         self.update_board_display()
         self.update_move_history()
         self.status_var.set("Ready")
