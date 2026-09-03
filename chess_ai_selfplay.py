@@ -1,50 +1,15 @@
-"""
-Chess AI with Self-Play Reinforcement Learning + Batched MCTS
-IMPROVED v4 — MCTS Tree Reuse:
-
-NEW IN THIS VERSION:
-- ✅ MCTS Tree Reuse: after each move, the subtree rooted at the chosen child
-  is retained and re-used as the starting point for the next search, preserving
-  all visit counts and Q-values accumulated in previous simulations.
-- ✅ `run_mcts_batched` accepts an optional `root_node` argument so existing
-  nodes receive additional simulations rather than starting fresh.
-- ✅ `select_move` maintains `self._mcts_root` and advances it after picking
-  a move (including handling an opponent move via the `last_opponent_move` arg).
-- ✅ `play_game` threads the reuse root across every ply of the self-play game.
-- ✅ Graceful fallback: if the desired child is absent (e.g. first move, or the
-  opponent played an unexpected move), a fresh root is built automatically.
-
-RETAINED FROM v3:
-- 19-channel input (piece planes + castling rights + en passant + move count)
-- Squeeze-and-Excitation (SE) ResBlocks — Leela Chess Zero style channel attention
-- AlphaZero-style cross-entropy policy loss (full 4096-dim MCTS visit distributions)
-- Deeper policy head: 32-channel 1x1 conv
-- Deeper value head: 64→256→128→1 MLP
-- Label smoothing on value targets (clipped to ±0.95)
-- Visit distributions stored AND correctly augmented in replay buffer
-- Batched MCTS evaluation (10-50x faster than sequential)
-- Mixed precision training (AMP) — 2-3x faster on RTX GPUs
-- Channels-last memory format for better conv performance
-- Masked softmax (no wasted compute on illegal moves)
-- Dirichlet noise at root (α=0.3, ε=0.25) for exploration
-- Temperature schedule (explore first 30 moves, greedy after)
-- Gradient clipping (1.0) for stability
-- L2 weight decay (1e-4) for regularization
-- Per-move augmentation (horizontal flip, safe for castling/en-passant)
-- Learning rate scheduler: warmup + cosine decay
-- Draw penalty (-0.3) and inline repetition penalties
-- Correct board perspective flip for Black
-"""
-
 import chess
+import chess.engine
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import random
+import pickle
 import os
 import math
+import shutil
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -54,292 +19,327 @@ import queue
 from collections import deque
 import time
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Neural Network
-# ──────────────────────────────────────────────────────────────────────────────
-
-class SEResBlock(nn.Module):
-    """
-    Pre-activation residual block with Squeeze-and-Excitation channel attention.
-
-    Architecture:
-      BN→ReLU→Conv3x3 → BN→ReLU→Conv3x3 → SE(scale+bias) + skip
-
-    SE path: global avg pool → Linear(C→C//4) → ReLU → Linear(C//4→2C) →
-             split into (scale, bias) → sigmoid(scale)*x + bias
-    """
-    def __init__(self, channels: int = 256, se_ratio: int = 4):
+# -------------------------
+# Neural Network Architecture
+# -------------------------
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        se_ch = channels // se_ratio
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
 
-        self.bn1   = nn.BatchNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-
-        self.se_fc1 = nn.Linear(channels, se_ch)
-        self.se_fc2 = nn.Linear(se_ch, channels * 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         residual = x
-
-        h = self.conv1(F.relu(self.bn1(x)))
-        h = self.conv2(F.relu(self.bn2(h)))
-
-        s = h.mean(dim=[2, 3])
-        s = F.relu(self.se_fc1(s))
-        s = self.se_fc2(s)
-        scale, bias = s.chunk(2, dim=1)
-        scale = torch.sigmoid(scale).unsqueeze(-1).unsqueeze(-1)
-        bias  = bias.unsqueeze(-1).unsqueeze(-1)
-
-        h = h * scale + bias
-        return h + residual
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return F.relu(x + residual)
 
 
 class ChessNet(nn.Module):
-    """
-    AlphaZero-style trunk with SE residual blocks and richer input encoding.
-
-    Input: 19-channel board tensor per position
-      Ch  0-5:  current player's pieces (P,N,B,R,Q,K)
-      Ch  6-11: opponent's pieces
-      Ch 12:    side to move (1=current player is White, 0=Black)
-      Ch 13:    current player kingside castling right
-      Ch 14:    current player queenside castling right
-      Ch 15:    opponent kingside castling right
-      Ch 16:    opponent queenside castling right
-      Ch 17:    en-passant target square (one-hot on the file)
-      Ch 18:    fullmove number, normalised to [0,1] (÷100, clamped)
-    """
-    NUM_RES_BLOCKS = 6
-    CHANNELS       = 256
-    IN_CHANNELS    = 19
-
-    def __init__(self):
-        super().__init__()
-
-        self.input_conv = nn.Conv2d(self.IN_CHANNELS, self.CHANNELS, 3, padding=1, bias=False)
-        self.input_bn   = nn.BatchNorm2d(self.CHANNELS)
-
+    def __init__(self, channels=128, num_res_blocks=6):
+        super(ChessNet, self).__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(19, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
         self.res_blocks = nn.Sequential(
-            *[SEResBlock(self.CHANNELS) for _ in range(self.NUM_RES_BLOCKS)]
+            *[ResidualBlock(channels) for _ in range(num_res_blocks)]
         )
 
-        self.policy_conv = nn.Conv2d(self.CHANNELS, 32, 1, bias=False)
-        self.policy_bn   = nn.BatchNorm2d(32)
-        self.policy_fc   = nn.Linear(32 * 8 * 8, 4096)
+        # AlphaZero-style policy head: keep spatial features until the final move map.
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(32 * 8 * 8, 4096),  # 64*64 possible from-to moves
+        )
 
-        self.value_conv  = nn.Conv2d(self.CHANNELS, 1, 1, bias=False)
-        self.value_bn    = nn.BatchNorm2d(1)
-        self.value_fc1   = nn.Linear(8 * 8, 256)
-        self.value_fc2   = nn.Linear(256, 128)
-        self.value_fc3   = nn.Linear(128, 1)
-        self.value_drop  = nn.Dropout(0.1)
+        # AlphaZero-style value head.
+        self.value_head = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(32 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
+            nn.Tanh(),
+        )
 
-        self._init_weights()
-
-    def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1.0)
-                nn.init.constant_(m.bias,   0.0)
-            elif isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if hasattr(m, "bias") and m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, x: torch.Tensor):
-        x = F.relu(self.input_bn(self.input_conv(x)))
+    def forward(self, x):
+        x = self.stem(x)
         x = self.res_blocks(x)
-
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
-        p = p.reshape(p.size(0), -1)
-        policy = self.policy_fc(p)
-
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = v.reshape(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        v = self.value_drop(v)
-        v = F.relu(self.value_fc2(v))
-        value = torch.tanh(self.value_fc3(v)).squeeze(-1)
-
-        return policy, value
+        policy = self.policy_head(x)
+        value = self.value_head(x)
+        return policy, value.squeeze(-1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Chess AI
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -------------------------
+# Chess AI with Batched MCTS + SAFE AUGMENTATION + REPETITION PENALTY
+# -------------------------
 class ChessAI:
-
     class MCTSNode:
-        __slots__ = ('board', 'parent', 'prior', 'children',
-                     'visits', 'value_sum', 'virtual_loss_count')
-
-        def __init__(self, board, parent=None, prior: float = 0.0):
-            self.board               = board
-            self.parent              = parent
-            self.prior               = prior
-            self.children: dict      = {}
-            self.visits: int         = 0
-            self.value_sum: float    = 0.0
-            self.virtual_loss_count: int = 0
+        def __init__(self, board, parent=None, prior=0.0):
+            self.board = board
+            self.parent = parent
+            self.prior = prior
+            self.children = {}
+            self.visits = 0
+            self.value_sum = 0.0
+            self.virtual_loss_count = 0
 
         @property
-        def q_value(self) -> float:
-            total = self.visits + self.virtual_loss_count
-            return 0.0 if total == 0 else self.value_sum / total
+        def q_value(self):
+            total_visits = self.visits + self.virtual_loss_count
+            if total_visits == 0:
+                return 0.0
+            return self.value_sum / total_visits
 
-    # ─── Constructor ─────────────────────────────────────────────────────────
-
-    def __init__(self,
-                 save_dir            = "chess_ai_models",
-                 replay_capacity     = 30000,
-                 batch_size          = 128,
-                 train_steps_per_game= 16,
-                 entropy_coef        = 0.005,
-                 value_coef          = 1.5,
-                 clip_grad           = 1.0,
-                 min_buffer_size     = 200,
-                 lr                  = 1e-4,
-                 weight_decay        = 1e-4,
-                 max_data_age        = 2000,
-                 draw_penalty        = -0.3,
-                 repetition_penalty  = -0.15,
-                 mcts_simulations    = 128,
-                 mcts_batch_size     = 8,
-                 mcts_c_puct         = 1.4,
-                 mcts_dirichlet_eps  = 0.25,
-                 mcts_dirichlet_alpha= 0.3,
-                 use_amp             = True):
+    def __init__(self, save_dir="chess_ai_models",
+                 replay_capacity=30000,
+                 batch_size=128,
+                 train_steps_per_game=64,
+                 entropy_coef=0.01,
+                 value_coef=1.5,
+                 clip_grad=1.0,
+                 min_buffer_size=200,
+                 lr=1e-4,
+                 weight_decay=1e-4,
+                 max_data_age=2000,
+                 draw_penalty=0.0,
+                 repetition_penalty=-0.05,
+                 repetition_draw_penalty=0.0,
+                 mcts_simulations=1024,
+                 mcts_batch_size=64,
+                 mcts_c_puct=1.4,
+                 mcts_dirichlet_eps=0.25,
+                 mcts_dirichlet_alpha=0.3,
+                 stockfish_path="c:\\Users\\libby\\Downloads\\stockfish-windows-x86-64-avx2\\stockfish\\stockfish-windows-x86-64-avx2.exe",
+                 stockfish_time_limit=1,
+                 stockfish_depth=24,
+                 stockfish_top_moves=5,
+                 stockfish_teacher_start=0.85,
+                 stockfish_teacher_end=0.20,
+                 stockfish_teacher_decay_games=10000,
+                 prioritized_replay_alpha=0.6,
+                 priority_epsilon=1e-3,
+                 human_policy_weight=0.25,
+                 use_amp=True):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model  = ChessNet().to(self.device)
+        self.model = ChessNet().to(self.device)
+        
         if self.device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
-
+        
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-
+        
         self.scheduler_total_steps = 50000
+        warmup_steps = 1000
+        
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step + 1) / float(max(1, warmup_steps))
+            progress = min(1.0, float(step - warmup_steps) / float(max(1, self.scheduler_total_steps - warmup_steps)))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        
+        self.use_amp = use_amp and self.device.type == 'cuda'
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        
+        self.save_dir = save_dir
+        self.training_stats = {
+            'games_played': 0,
+            'total_moves': 0,
+            'white_wins': 0,
+            'black_wins': 0,
+            'draws': 0,
+            'total_training_steps': 0,
+            'positions_flipped': 0,
+            'positions_total': 0,
+            'repetition_penalties_applied': 0,
+            'total_game_time': 0.0,
+            'total_train_time': 0.0,
+            'last_game_time': 0.0,
+            'last_train_time': 0.0,
+            'last_game_moves': 0,
+            'last_draw_reason': '',
+            'rule_draws': 0,
+            'max_move_draws': 0,
+            'human_games': 0,
+            'human_positions': 0,
+            'human_train_steps': 0,
+            'stockfish_games': 0,
+            'stockfish_positions': 0,
+            'stockfish_unavailable_games': 0,
+        }
+        self.stop_training_flag = False
+        
+        self.replay_capacity = replay_capacity
+        self.replay_buffer = deque(maxlen=replay_capacity)
+        self.batch_size = batch_size
+        self.train_steps_per_game = train_steps_per_game
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.clip_grad = clip_grad
+        self.min_buffer_size = min_buffer_size
+        self.max_data_age = max_data_age
+        self.draw_penalty = draw_penalty
+        self.repetition_penalty = repetition_penalty
+        self.repetition_draw_penalty = repetition_draw_penalty
+        
+        self.mcts_simulations = mcts_simulations
+        self.mcts_batch_size = mcts_batch_size
+        self.mcts_c_puct = mcts_c_puct
+        self.mcts_dirichlet_eps = mcts_dirichlet_eps
+        self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
+        self.stockfish_path = stockfish_path or os.environ.get("STOCKFISH_PATH") or shutil.which("stockfish")
+        self.stockfish_time_limit = stockfish_time_limit
+        self.stockfish_depth = stockfish_depth
+        self.stockfish_top_moves = stockfish_top_moves
+        self.stockfish_teacher_start = stockfish_teacher_start
+        self.stockfish_teacher_end = stockfish_teacher_end
+        self.stockfish_teacher_decay_games = stockfish_teacher_decay_games
+        self.stockfish_engine = None
+        self.stockfish_disabled_reason = ""
+        self.prioritized_replay_alpha = prioritized_replay_alpha
+        self.priority_epsilon = priority_epsilon
+        self.human_policy_weight = human_policy_weight
+        
+        self.data_counter = 0
+        self.loss_history = deque(maxlen=100)
+        
+        os.makedirs(save_dir, exist_ok=True)
+        self.load_model()
+
+    def new_training_stats(self):
+        return {
+            'games_played': 0,
+            'total_moves': 0,
+            'white_wins': 0,
+            'black_wins': 0,
+            'draws': 0,
+            'total_training_steps': 0,
+            'positions_flipped': 0,
+            'positions_total': 0,
+            'repetition_penalties_applied': 0,
+            'total_game_time': 0.0,
+            'total_train_time': 0.0,
+            'last_game_time': 0.0,
+            'last_train_time': 0.0,
+            'last_game_moves': 0,
+            'last_draw_reason': '',
+            'rule_draws': 0,
+            'max_move_draws': 0,
+            'human_games': 0,
+            'human_positions': 0,
+            'human_train_steps': 0,
+            'stockfish_games': 0,
+            'stockfish_positions': 0,
+            'stockfish_unavailable_games': 0,
+        }
+
+    def reset_learning_state(self, archive_checkpoint=True):
+        model_path = os.path.join(self.save_dir, "model_latest.pth")
+        if archive_checkpoint and os.path.exists(model_path):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(self.save_dir, f"model_reset_backup_{timestamp}.pth")
+            os.replace(model_path, backup_path)
+
+        self.model = ChessNet().to(self.device)
+        if self.device.type == 'cuda':
+            self.model = self.model.to(memory_format=torch.channels_last)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+
         warmup_steps = 1000
         def lr_lambda(step):
             if step < warmup_steps:
                 return float(step + 1) / float(max(1, warmup_steps))
-            progress = min(1.0, float(step - warmup_steps) /
-                          float(max(1, self.scheduler_total_steps - warmup_steps)))
+            progress = min(1.0, float(step - warmup_steps) / float(max(1, self.scheduler_total_steps - warmup_steps)))
             return 0.5 * (1.0 + math.cos(math.pi * progress))
+
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-
-        self.use_amp = use_amp and self.device.type == 'cuda'
-        self.scaler  = torch.cuda.amp.GradScaler() if self.use_amp else None
-
-        self.save_dir = save_dir
-        self.training_stats = {
-            'games_played': 0, 'total_moves': 0,
-            'white_wins': 0, 'black_wins': 0, 'draws': 0,
-            'total_training_steps': 0,
-            'positions_flipped': 0, 'positions_total': 0,
-            'repetition_penalties_applied': 0,
-            'tree_reuse_hits': 0,       # ← new: tracks successful reuse
-            'tree_reuse_misses': 0,     # ← new: tracks cold-start fallbacks
-        }
-        self.stop_training_flag = False
-
-        self.replay_capacity      = replay_capacity
-        self.replay_buffer        = deque(maxlen=replay_capacity)
-        self.batch_size           = batch_size
-        self.train_steps_per_game = train_steps_per_game
-        self.entropy_coef         = entropy_coef
-        self.value_coef           = value_coef
-        self.clip_grad            = clip_grad
-        self.min_buffer_size      = min_buffer_size
-        self.max_data_age         = max_data_age
-        self.draw_penalty         = draw_penalty
-        self.repetition_penalty   = repetition_penalty
-
-        self.mcts_simulations     = mcts_simulations
-        self.mcts_batch_size      = mcts_batch_size
-        self.mcts_c_puct          = mcts_c_puct
-        self.mcts_dirichlet_eps   = mcts_dirichlet_eps
-        self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
-
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        self.training_stats = self.new_training_stats()
+        self.replay_buffer.clear()
         self.data_counter = 0
-        self.loss_history = deque(maxlen=100)
-
-        # ── Tree reuse state ─────────────────────────────────────────────────
-        # Holds the MCTSNode that will be used as the starting root for the
-        # *next* call to run_mcts_batched.  Reset to None whenever a new game
-        # starts or a cache miss occurs.
-        self._mcts_root: 'ChessAI.MCTSNode | None' = None
-
-        os.makedirs(save_dir, exist_ok=True)
-        self.load_model()
-
-    # ─── Board / move encoding ────────────────────────────────────────────────
-
-    def board_to_tensor(self, board: chess.Board) -> torch.Tensor:
+        self.loss_history.clear()
+    
+    # -------------------------
+    # Board / move helpers
+    # -------------------------
+    def board_to_tensor(self, board):
         tensor = np.zeros((19, 8, 8), dtype=np.float32)
-
-        piece_to_ch = {
+        piece_to_channel = {
             chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-            chess.ROOK: 3, chess.QUEEN:  4, chess.KING:   5,
+            chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
         }
-        current = board.turn
+        current_player = board.turn
         for sq in chess.SQUARES:
             p = board.piece_at(sq)
             if p:
-                ch   = piece_to_ch[p.piece_type] + (0 if p.color == current else 6)
+                ch = piece_to_channel[p.piece_type]
+                if p.color != current_player:
+                    ch += 6
                 file = chess.square_file(sq)
                 rank = chess.square_rank(sq)
-                if current == chess.BLACK:
+                if current_player == chess.BLACK:
                     rank = 7 - rank
                 tensor[ch, rank, file] = 1.0
 
-        tensor[12] = 1.0 if current == chess.WHITE else 0.0
-
-        if current == chess.WHITE:
-            tensor[13] = float(board.has_kingside_castling_rights(chess.WHITE))
-            tensor[14] = float(board.has_queenside_castling_rights(chess.WHITE))
-            tensor[15] = float(board.has_kingside_castling_rights(chess.BLACK))
-            tensor[16] = float(board.has_queenside_castling_rights(chess.BLACK))
-        else:
-            tensor[13] = float(board.has_kingside_castling_rights(chess.BLACK))
-            tensor[14] = float(board.has_queenside_castling_rights(chess.BLACK))
-            tensor[15] = float(board.has_kingside_castling_rights(chess.WHITE))
-            tensor[16] = float(board.has_queenside_castling_rights(chess.WHITE))
+        tensor[12, :, :] = 1.0 if current_player == chess.WHITE else 0.0
+        own_color = current_player
+        opp_color = not current_player
+        tensor[13, :, :] = 1.0 if board.has_kingside_castling_rights(own_color) else 0.0
+        tensor[14, :, :] = 1.0 if board.has_queenside_castling_rights(own_color) else 0.0
+        tensor[15, :, :] = 1.0 if board.has_kingside_castling_rights(opp_color) else 0.0
+        tensor[16, :, :] = 1.0 if board.has_queenside_castling_rights(opp_color) else 0.0
 
         if board.ep_square is not None:
             ep_file = chess.square_file(board.ep_square)
             ep_rank = chess.square_rank(board.ep_square)
-            if current == chess.BLACK:
+            if current_player == chess.BLACK:
                 ep_rank = 7 - ep_rank
             tensor[17, ep_rank, ep_file] = 1.0
 
-        tensor[18] = min(1.0, board.fullmove_number / 100.0)
-
+        tensor[18, :, :] = min(1.0, board.halfmove_clock / 100.0)
         return torch.from_numpy(tensor).unsqueeze(0)
-
-    def move_to_index(self, move: chess.Move, flip: bool = False) -> int:
-        from_sq, to_sq = move.from_square, move.to_square
+    
+    def move_to_index(self, move, flip=False):
+        from_sq = move.from_square
+        to_sq = move.to_square
         if flip:
-            from_sq = chess.square(chess.square_file(from_sq), 7 - chess.square_rank(from_sq))
-            to_sq   = chess.square(chess.square_file(to_sq),   7 - chess.square_rank(to_sq))
+            from_file, from_rank = chess.square_file(from_sq), chess.square_rank(from_sq)
+            to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
+            from_sq = chess.square(from_file, 7 - from_rank)
+            to_sq = chess.square(to_file, 7 - to_rank)
         return from_sq * 64 + to_sq
-
-    def index_to_move(self, board: chess.Board, idx: int, flip: bool = False):
-        from_sq, to_sq = idx // 64, idx % 64
+    
+    def index_to_move(self, board, idx, flip=False):
+        from_sq = idx // 64
+        to_sq = idx % 64
         if flip:
-            from_sq = chess.square(chess.square_file(from_sq), 7 - chess.square_rank(from_sq))
-            to_sq   = chess.square(chess.square_file(to_sq),   7 - chess.square_rank(to_sq))
+            from_file, from_rank = chess.square_file(from_sq), chess.square_rank(from_sq)
+            to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
+            from_sq = chess.square(from_file, 7 - from_rank)
+            to_sq = chess.square(to_file, 7 - to_rank)
         candidate = chess.Move(from_sq, to_sq)
         if candidate in board.legal_moves:
             return candidate
-        for promo in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-            m = chess.Move(from_sq, to_sq, promotion=promo)
+        for promo_piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+            m = chess.Move(from_sq, to_sq, promotion=promo_piece)
             if m in board.legal_moves:
                 return m
         for m in board.legal_moves:
@@ -347,472 +347,1121 @@ class ChessAI:
                 return m
         return None
 
-    # ─── Augmentation ─────────────────────────────────────────────────────────
+    def position_key(self, board):
+        return " ".join(board.fen().split(" ")[:4])
 
-    def is_move_augmentable(self, board: chess.Board, move: chess.Move) -> bool:
-        return not board.is_castling(move) and not board.is_en_passant(move)
+    def layout_key(self, board):
+        return board.board_fen()
 
-    def _flip_visit_distribution(self, visit_dist: np.ndarray) -> np.ndarray:
-        flipped = np.zeros(4096, dtype=np.float32)
-        nz = np.nonzero(visit_dist)[0]
-        for idx in nz:
-            from_sq, to_sq = int(idx) // 64, int(idx) % 64
-            new_from = (from_sq // 8) * 8 + (7 - from_sq % 8)
-            new_to   = (to_sq   // 8) * 8 + (7 - to_sq   % 8)
-            flipped[new_from * 64 + new_to] = visit_dist[idx]
-        return flipped
+    def new_repetition_tracker(self):
+        return {'exact': {}, 'layout': {}}
 
-    def augment(self, board_tensor: torch.Tensor, visit_dist: np.ndarray,
-                can_flip: bool):
-        items = [(board_tensor.clone(), visit_dist.copy())]
+    def repetition_count_for_board(self, board, position_counts):
+        if not position_counts:
+            return 0
+
+        if 'exact' in position_counts and 'layout' in position_counts:
+            exact_count = position_counts['exact'].get(self.position_key(board), 0)
+            layout_count = position_counts['layout'].get(self.layout_key(board), 0)
+            return max(exact_count, layout_count)
+
+        return position_counts.get(self.position_key(board), 0)
+
+    def record_position_visit(self, board, position_counts):
+        if 'exact' in position_counts and 'layout' in position_counts:
+            exact_key = self.position_key(board)
+            layout_key = self.layout_key(board)
+            position_counts['exact'][exact_key] = position_counts['exact'].get(exact_key, 0) + 1
+            position_counts['layout'][layout_key] = position_counts['layout'].get(layout_key, 0) + 1
+            return
+
+        position_key = self.position_key(board)
+        position_counts[position_key] = position_counts.get(position_key, 0) + 1
+
+    def repetition_penalty_for_visits(self, visit_count):
+        if visit_count <= 0:
+            return 0.0
+        return self.repetition_penalty * visit_count
+
+    def move_repetition_counts(self, board, moves, position_counts):
+        if not position_counts:
+            return np.zeros(len(moves), dtype=np.int32)
+
+        repeat_counts = []
+        for move in moves:
+            next_board = board.copy()
+            next_board.push(move)
+            repeat_counts.append(self.repetition_count_for_board(next_board, position_counts))
+        return np.array(repeat_counts, dtype=np.int32)
+
+    def avoid_repeated_position_probs(self, board, moves, probs, position_counts):
+        if not position_counts or not moves:
+            return probs
+
+        repeat_counts = self.move_repetition_counts(board, moves, position_counts)
+        if not repeat_counts.any():
+            return probs
+
+        probs = np.asarray(probs, dtype=np.float64).copy()
+        fresh_mask = repeat_counts == 0
+        if fresh_mask.any():
+            probs[~fresh_mask] = 0.0
+            if float(probs.sum(dtype=np.float64)) <= 0.0:
+                probs[fresh_mask] = 1.0
+        else:
+            probs /= (1.0 + repeat_counts.astype(np.float64))
+        return probs
+
+    def move_into_repetition_penalty(self, board, move, position_counts):
+        if not position_counts or move is None:
+            return 0.0
+
+        next_board = board.copy()
+        next_board.push(move)
+        visit_count = self.repetition_count_for_board(next_board, position_counts)
+        return self.repetition_penalty_for_visits(visit_count)
+
+    def is_repetition_draw(self, board):
+        return board.is_fivefold_repetition() or board.can_claim_threefold_repetition()
+
+    def is_terminal_for_training(self, board):
+        return board.is_game_over() or board.can_claim_threefold_repetition()
+
+    def draw_value_for_board(self, board):
+        if self.is_repetition_draw(board):
+            return self.repetition_draw_penalty
+        return self.draw_penalty
+
+    def is_draw_reward(self, reward):
+        return (
+            abs(reward - self.draw_penalty) < 1e-6 or
+            abs(reward - self.repetition_draw_penalty) < 1e-6
+        )
+
+    def terminal_value_for_side_to_move(self, board):
+        outcome = board.outcome(claim_draw=True)
+        if outcome and outcome.winner == chess.WHITE:
+            return 1.0 if board.turn == chess.WHITE else -1.0
+        if outcome and outcome.winner == chess.BLACK:
+            return 1.0 if board.turn == chess.BLACK else -1.0
+        return self.draw_value_for_board(board)
+
+    def is_draw_result(self, board):
+        outcome = board.outcome(claim_draw=True)
+        return outcome is not None and outcome.winner is None
+
+    # -------------------------
+    # Stockfish teacher
+    # -------------------------
+    def stockfish_available(self):
+        return bool(self.stockfish_path) and not self.stockfish_disabled_reason
+
+    def stockfish_limit(self):
+        kwargs = {}
+        if self.stockfish_time_limit and self.stockfish_time_limit > 0:
+            kwargs['time'] = self.stockfish_time_limit
+        if self.stockfish_depth and self.stockfish_depth > 0:
+            kwargs['depth'] = self.stockfish_depth
+        return chess.engine.Limit(**kwargs)
+
+    def get_stockfish_engine(self):
+        if not self.stockfish_path:
+            self.stockfish_disabled_reason = "Stockfish path is empty"
+            return None
+        if self.stockfish_disabled_reason:
+            return None
+        if self.stockfish_engine is not None:
+            return self.stockfish_engine
+        try:
+            self.stockfish_engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
+            return self.stockfish_engine
+        except Exception as e:
+            self.stockfish_disabled_reason = str(e)
+            self.stockfish_engine = None
+            return None
+
+    def close_stockfish_engine(self):
+        if self.stockfish_engine is None:
+            return
+        try:
+            self.stockfish_engine.quit()
+        except Exception:
+            pass
+        self.stockfish_engine = None
+
+    def stockfish_teacher_rate(self):
+        start = float(np.clip(self.stockfish_teacher_start, 0.0, 1.0))
+        end = float(np.clip(self.stockfish_teacher_end, 0.0, 1.0))
+        decay_games = max(1, int(self.stockfish_teacher_decay_games))
+        progress = min(1.0, self.training_stats.get('games_played', 0) / decay_games)
+        return start + (end - start) * progress
+
+    def should_use_stockfish_teacher(self):
+        if self.stockfish_teacher_rate() <= 0.0:
+            return False
+        if not self.stockfish_path or self.stockfish_disabled_reason:
+            return False
+        return random.random() < self.stockfish_teacher_rate()
+
+    def stockfish_score_to_value(self, score, board):
+        if score is None:
+            return 0.0
+        cp = score.pov(board.turn).score(mate_score=100000)
+        if cp is None:
+            return 0.0
+        return float(np.tanh(np.clip(cp, -2000, 2000) / 600.0))
+
+    def stockfish_policy_value(self, board, top_moves=None):
+        engine = self.get_stockfish_engine()
+        if engine is None:
+            return None
+
+        legal_count = board.legal_moves.count()
+        if legal_count <= 0:
+            return None
+        multipv = max(1, min(int(top_moves or self.stockfish_top_moves), legal_count))
+
+        try:
+            infos = engine.analyse(board, self.stockfish_limit(), multipv=multipv)
+        except Exception as e:
+            self.stockfish_disabled_reason = str(e)
+            self.close_stockfish_engine()
+            return None
+
+        if isinstance(infos, dict):
+            infos = [infos]
+
+        move_scores = []
+        best_score = None
+        teacher_value = 0.0
+        for info in infos:
+            pv = info.get('pv') or []
+            score = info.get('score')
+            if not pv or score is None:
+                continue
+            move = pv[0]
+            if move not in board.legal_moves:
+                continue
+            cp = score.pov(board.turn).score(mate_score=100000)
+            if cp is None:
+                continue
+            cp = float(np.clip(cp, -2000, 2000))
+            if best_score is None or cp > best_score:
+                best_score = cp
+                teacher_value = self.stockfish_score_to_value(score, board)
+            move_scores.append((move, cp))
+
+        if not move_scores:
+            return None
+
+        scores = np.array([score for _, score in move_scores], dtype=np.float64)
+        weights = np.exp((scores - scores.max()) / 60.0)
+        probs = self.normalize_probabilities(weights)
+        return [(move, float(prob)) for (move, _), prob in zip(move_scores, probs)], teacher_value
+
+    def move_probs_to_policy_target(self, board, move_probs):
+        flip = (board.turn == chess.BLACK)
+        return tuple(
+            (self.move_to_index(move, flip=flip), float(prob))
+            for move, prob in move_probs
+            if prob > 0.0
+        )
+
+    def verified_human_policy_target(self, board, move, fallback_policy):
+        stockfish_result = self.stockfish_policy_value(board)
+        if stockfish_result is None:
+            return fallback_policy, self.human_policy_weight
+
+        stockfish_move_probs, _ = stockfish_result
+        human_idx = self.move_to_index(move, flip=(board.turn == chess.BLACK))
+        stockfish_target = self.move_probs_to_policy_target(board, stockfish_move_probs)
+        stockfish_indices = {idx for idx, _ in stockfish_target}
+
+        if human_idx in stockfish_indices:
+            blended = {idx: prob * 0.75 for idx, prob in stockfish_target}
+            blended[human_idx] = blended.get(human_idx, 0.0) + 0.25
+            return tuple((idx, prob) for idx, prob in blended.items()), 0.75
+
+        return stockfish_target, self.human_policy_weight
+
+    # -------------------------
+    # Safe augmentation
+    # -------------------------
+    def is_position_symmetric_safe(self, board):
+        if board.has_kingside_castling_rights(chess.WHITE): return False
+        if board.has_queenside_castling_rights(chess.WHITE): return False
+        if board.has_kingside_castling_rights(chess.BLACK): return False
+        if board.has_queenside_castling_rights(chess.BLACK): return False
+        if board.ep_square is not None: return False
+        return True
+    
+    def augment_tensor_and_index(self, board_tensor, move_idx, can_flip=False):
+        augmented = [(board_tensor.clone(), move_idx)]
         if can_flip:
-            items.append((
-                torch.flip(board_tensor, [3]),
-                self._flip_visit_distribution(visit_dist),
-            ))
-        return items
+            flipped_tensor = torch.flip(board_tensor, [3])
+            move_idx_flipped = self.flip_move_index_horizontal(move_idx)
+            augmented.append((flipped_tensor, move_idx_flipped))
+        return augmented
 
-    # ─── Tree reuse helpers ───────────────────────────────────────────────────
+    def flip_move_index_horizontal(self, move_idx):
+        from_sq = move_idx // 64
+        to_sq = move_idx % 64
+        from_file, from_rank = from_sq % 8, from_sq // 8
+        to_file, to_rank = to_sq % 8, to_sq // 8
+        from_sq_flipped = (7 - from_file) + from_rank * 8
+        to_sq_flipped = (7 - to_file) + to_rank * 8
+        return from_sq_flipped * 64 + to_sq_flipped
 
-    def reset_tree(self):
-        """Discard the cached MCTS tree (call at the start of each new game)."""
-        self._mcts_root = None
+    def augment_tensor_and_policy(self, board_tensor, policy_target, can_flip=False):
+        augmented = [(board_tensor.clone(), policy_target)]
+        if can_flip:
+            flipped_tensor = torch.flip(board_tensor, [3])
+            flipped_policy = tuple(
+                (self.flip_move_index_horizontal(move_idx), prob)
+                for move_idx, prob in policy_target
+            )
+            augmented.append((flipped_tensor, flipped_policy))
+        return augmented
 
-    def _advance_tree(self, move: chess.Move) -> 'ChessAI.MCTSNode | None':
-        """
-        Descend one level into the cached tree along `move`.
+    def legal_policy_indices(self, board):
+        flip = (board.turn == chess.BLACK)
+        return tuple(self.move_to_index(move, flip=flip) for move in board.legal_moves)
 
-        Returns the child node (detached from the old tree) on a cache hit,
-        or None on a miss.  The caller is responsible for updating
-        self._mcts_root with the returned value.
-        """
-        if self._mcts_root is None:
+    def invalid_policy_logit(self, logits):
+        # -1e9 overflows under CUDA AMP fp16; this value is safely representable.
+        if logits.dtype == torch.float16:
+            return -1e4
+        return torch.finfo(logits.dtype).min
+
+    def normalize_probabilities(self, probs):
+        try:
+            probs = np.asarray(probs, dtype=np.float64).reshape(-1)
+        except Exception:
+            return np.array([], dtype=np.float64)
+        if probs.size == 0:
+            return probs
+
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = np.clip(probs, 0.0, None)
+        total = float(probs.sum(dtype=np.float64))
+        if not np.isfinite(total) or total <= 0.0:
+            return np.full(probs.shape, 1.0 / probs.size, dtype=np.float64)
+
+        probs = probs / total
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = np.clip(probs, 0.0, None)
+        total = float(probs.sum(dtype=np.float64))
+        if not np.isfinite(total) or total <= 0.0:
+            return np.full(probs.shape, 1.0 / probs.size, dtype=np.float64)
+
+        probs = probs / total
+        # Compensate for tiny floating point drift so numpy accepts p exactly.
+        probs[-1] += 1.0 - float(probs.sum(dtype=np.float64))
+        if not np.all(np.isfinite(probs)) or np.any(probs < 0.0):
+            return np.full(probs.shape, 1.0 / probs.size, dtype=np.float64)
+        return probs
+
+    def safe_choice_index(self, count, probs):
+        if count <= 0:
             return None
-        child = self._mcts_root.children.get(move)
-        if child is None:
-            return None
-        # Detach so the rest of the old tree can be garbage-collected
-        child.parent = None
-        return child
+        probs = self.normalize_probabilities(probs)
+        if probs.size != count or not np.all(np.isfinite(probs)):
+            probs = np.full(count, 1.0 / count, dtype=np.float64)
+        try:
+            return int(np.random.choice(count, p=probs))
+        except ValueError:
+            return int(np.random.randint(count))
 
-    # ─── Batched network inference ─────────────────────────────────────────────
+    def compact_training_targets(self, policy_target, legal_indices):
+        policy_by_idx = {}
+        for move_idx, prob in policy_target:
+            if 0 <= move_idx < 4096:
+                policy_by_idx[move_idx] = policy_by_idx.get(move_idx, 0.0) + float(prob)
 
+        total_prob = sum(policy_by_idx.values())
+        if total_prob > 0:
+            policy_items = [
+                (idx, prob / total_prob)
+                for idx, prob in policy_by_idx.items()
+                if prob > 0.0
+            ]
+        else:
+            policy_items = []
+
+        if policy_items:
+            policy_indices, policy_probs = zip(*policy_items)
+            policy_indices = torch.tensor(policy_indices, dtype=torch.long)
+            policy_probs = torch.tensor(policy_probs, dtype=torch.float32)
+        else:
+            policy_indices = torch.empty(0, dtype=torch.long)
+            policy_probs = torch.empty(0, dtype=torch.float32)
+
+        legal_indices = sorted({idx for idx in legal_indices if 0 <= idx < 4096})
+        legal_indices = torch.tensor(legal_indices, dtype=torch.long)
+        return (policy_indices, policy_probs), legal_indices
+
+    def flip_index_tuple_horizontal(self, move_indices):
+        return tuple(self.flip_move_index_horizontal(move_idx) for move_idx in move_indices)
+
+    def augment_training_entry(self, board_tensor, policy_target, legal_indices, can_flip=False):
+        augmented = [(board_tensor.clone(), policy_target, legal_indices)]
+        if can_flip:
+            flipped_tensor = torch.flip(board_tensor, [3])
+            flipped_policy = tuple(
+                (self.flip_move_index_horizontal(move_idx), prob)
+                for move_idx, prob in policy_target
+            )
+            flipped_legal = self.flip_index_tuple_horizontal(legal_indices)
+            augmented.append((flipped_tensor, flipped_policy, flipped_legal))
+        return augmented
+
+    # -------------------------
+    # Batched network inference
+    # -------------------------
     def evaluate_batch(self, board_list):
-        if not board_list:
+        if len(board_list) == 0:
             return []
+        
         self.model.eval()
         with torch.no_grad():
-            batch = torch.cat([self.board_to_tensor(b) for b in board_list], dim=0).to(self.device)
+            board_tensors = [self.board_to_tensor(board) for board in board_list]
+            batch_tensor = torch.cat(board_tensors, dim=0).to(self.device)
             if self.device.type == 'cuda':
-                batch = batch.to(memory_format=torch.channels_last)
+                batch_tensor = batch_tensor.to(memory_format=torch.channels_last)
+
+            legal_moves_batch = []
+            legal_indices_batch = []
+            for board in board_list:
+                flip = (board.turn == chess.BLACK)
+                legal_moves = list(board.legal_moves)
+                legal_indices = [
+                    self.move_to_index(move, flip=flip)
+                    for move in legal_moves
+                ]
+                legal_moves_batch.append(legal_moves)
+                legal_indices_batch.append([
+                    idx for idx in legal_indices
+                    if 0 <= idx < 4096
+                ])
+
             with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-                policy_logits, values = self.model(batch)
-            policy_logits = policy_logits.cpu()
-            values        = values.cpu().numpy()
+                policy_logits, values = self.model(batch_tensor)
 
-        results = []
-        for i, board in enumerate(board_list):
-            logits      = policy_logits[i]
-            value       = float(values[i])
-            flip        = (board.turn == chess.BLACK)
-            legal_moves = list(board.legal_moves)
+            policy_logits = torch.nan_to_num(
+                policy_logits.float(),
+                nan=0.0,
+                posinf=1e4,
+                neginf=-1e4
+            )
+            values = torch.nan_to_num(
+                values.float(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0
+            ).cpu().numpy()
+            legal_mask = torch.zeros(
+                (len(board_list), 4096),
+                dtype=torch.bool,
+                device=self.device
+            )
+            row_parts = []
+            col_parts = []
+            for row, legal_indices in enumerate(legal_indices_batch):
+                if legal_indices:
+                    col_tensor = torch.tensor(
+                        legal_indices,
+                        dtype=torch.long,
+                        device=self.device
+                    )
+                    row_parts.append(torch.full_like(col_tensor, row))
+                    col_parts.append(col_tensor)
+            if row_parts:
+                rows = torch.cat(row_parts)
+                cols = torch.cat(col_parts)
+                legal_mask[rows, cols] = True
 
-            mask = torch.full((4096,), -float('inf'))
-            for m in legal_moves:
-                idx = self.move_to_index(m, flip=flip)
-                if idx < 4096:
-                    mask[idx] = 0.0
-            probs_t = torch.softmax(logits + mask, dim=0)
-
-            move_probs = []
-            for m in legal_moves:
-                idx = self.move_to_index(m, flip=flip)
-                p   = float(probs_t[idx]) if idx < 4096 else 1.0 / len(legal_moves)
-                move_probs.append((m, p))
-
-            total = sum(p for _, p in move_probs)
-            if total > 0 and abs(total - 1.0) > 1e-6:
-                move_probs = [(m, p / total) for m, p in move_probs]
-
-            results.append((move_probs, value))
-        return results
-
-    def get_move_probabilities(self, board: chess.Board):
-        r = self.evaluate_batch([board])
-        return r[0] if r else ([], 0.0)
-
-    # ─── Batched MCTS ──────────────────────────────────────────────────────────
-
-    def run_mcts_batched(self,
-                         root_board: chess.Board,
-                         simulations=None,
-                         add_dirichlet_noise: bool = False,
-                         game_position_counts: dict = None,
-                         root_node: 'ChessAI.MCTSNode | None' = None):
+            masked_logits = policy_logits.masked_fill(
+                ~legal_mask,
+                self.invalid_policy_logit(policy_logits)
+            )
+            move_probs_tensor = F.softmax(masked_logits, dim=1)
+            
+            results = []
+            for i, board in enumerate(board_list):
+                value = float(values[i])
+                legal_moves = legal_moves_batch[i]
+                legal_indices = legal_indices_batch[i]
+                legal_move_probs = []
+                if legal_indices:
+                    idx_tensor = torch.tensor(
+                        legal_indices,
+                        dtype=torch.long,
+                        device=self.device
+                    )
+                    probs = move_probs_tensor[i, idx_tensor].float().cpu().numpy()
+                    probs = self.normalize_probabilities(probs)
+                else:
+                    probs = np.array([], dtype=np.float64)
+                for move, prob in zip(legal_moves, probs):
+                    legal_move_probs.append((move, float(prob)))
+                results.append((legal_move_probs, value))
+            return results
+    
+    def get_move_probabilities(self, board):
+        results = self.evaluate_batch([board])
+        return results[0] if results else ([], 0.0)
+    
+    # -------------------------
+    # Batched MCTS
+    # -------------------------
+    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False, game_position_counts=None):
         """
-        Run MCTS from `root_board`.
+        Run MCTS with batched neural network evaluation and CORRECT virtual loss.
 
-        Parameters
-        ----------
-        root_node : MCTSNode or None
-            If provided, this node is used as the root instead of building a
-            fresh one.  Its existing visit counts and children are preserved,
-            and the requested number of *additional* simulations are run on top.
-            Pass None (or omit) to start from scratch.
+        game_position_counts: dict of {position_key: visit_count} from the current game.
+        Leaf nodes whose position has already been seen in the real game get their
+        value penalized directly, so MCTS steers away from repetition during search.
         """
         if simulations is None:
             simulations = self.mcts_simulations
         if game_position_counts is None:
             game_position_counts = {}
-
-        # ── Initialise root ───────────────────────────────────────────────────
-        if root_node is not None and root_node.children:
-            # Reuse the existing subtree; just update the board reference so
-            # the node reflects the canonical position we were asked to search.
-            root = root_node
-            root.board = root_board.copy()   # refresh in case of copy mismatch
-            self.training_stats['tree_reuse_hits'] += 1
-        else:
-            # Cold start: build a new root from scratch
-            root = self.MCTSNode(root_board.copy())
-            move_probs, _ = self.get_move_probabilities(root.board)
-            for m, prob in move_probs:
-                cb = root.board.copy(); cb.push(m)
-                root.children[m] = self.MCTSNode(cb, parent=root, prior=prob)
-            self.training_stats['tree_reuse_misses'] += 1
-
-        # ── Dirichlet noise at root (always applied fresh each search) ────────
-        if add_dirichlet_noise and root.children:
-            eps, alpha = self.mcts_dirichlet_eps, self.mcts_dirichlet_alpha
+        
+        root = self.MCTSNode(root_board.copy(), parent=None, prior=0.0)
+        move_probs, value = self.get_move_probabilities(root.board)
+        for move, prob in move_probs:
+            child_board = root.board.copy()
+            child_board.push(move)
+            prior = float(prob) if np.isfinite(prob) and prob > 0.0 else 0.0
+            root.children[move] = self.MCTSNode(child_board, parent=root, prior=prior)
+        
+        if add_dirichlet_noise and len(root.children) > 0:
+            eps = self.mcts_dirichlet_eps
+            alpha = self.mcts_dirichlet_alpha
             moves = list(root.children.keys())
             noise = np.random.dirichlet([alpha] * len(moves))
             for i, m in enumerate(moves):
-                root.children[m].prior = (
-                    (1 - eps) * root.children[m].prior + eps * noise[i]
-                )
-
-        # ── Simulation loop ───────────────────────────────────────────────────
+                old_prior = root.children[m].prior
+                if not np.isfinite(old_prior) or old_prior < 0.0:
+                    old_prior = 0.0
+                root.children[m].prior = (1 - eps) * old_prior + eps * noise[i]
+        
         num_batches = (simulations + self.mcts_batch_size - 1) // self.mcts_batch_size
-
-        for bi in range(num_batches):
-            bs = min(self.mcts_batch_size, simulations - bi * self.mcts_batch_size)
-            search_paths, leaf_nodes = [], []
-
-            for _ in range(bs):
-                node, path = root, [root]
-                while node.children:
-                    N_total = sum(c.visits + c.virtual_loss_count
-                                  for c in node.children.values()) + 1
-                    best, best_m = -1e9, None
-                    for m, child in node.children.items():
-                        u = (self.mcts_c_puct * child.prior *
-                             math.sqrt(N_total) / (1 + child.visits + child.virtual_loss_count))
-                        score = child.q_value + u
-                        if score > best:
-                            best, best_m = score, m
-                    if best_m is None:
+        
+        for batch_idx in range(num_batches):
+            batch_size = min(self.mcts_batch_size, simulations - batch_idx * self.mcts_batch_size)
+            search_paths = []
+            leaf_nodes = []
+            
+            for _ in range(batch_size):
+                node = root
+                search_path = [node]
+                while len(node.children) > 0:
+                    total_visits = sum(child.visits + child.virtual_loss_count
+                                      for child in node.children.values()) + 1
+                    best_score = -1e9
+                    best_move = None
+                    for move, child in node.children.items():
+                        q = -child.q_value
+                        repeat_count = self.repetition_count_for_board(child.board, game_position_counts)
+                        if repeat_count > 0:
+                            q = float(np.clip(q + self.repetition_penalty_for_visits(repeat_count), -1.0, 1.0))
+                        prior = child.prior if np.isfinite(child.prior) and child.prior > 0.0 else 0.0
+                        u = self.mcts_c_puct * prior * math.sqrt(total_visits) / (1 + child.visits + child.virtual_loss_count)
+                        score = q + u
+                        if score > best_score:
+                            best_score = score
+                            best_move = move
+                    if best_move is None:
                         break
-                    node = node.children[best_m]
+                    node = node.children[best_move]
                     node.virtual_loss_count += 1
-                    path.append(node)
-                search_paths.append(path)
+                    search_path.append(node)
+                search_paths.append(search_path)
                 leaf_nodes.append(node)
-
-            to_eval, terminal_vals, eval_map = [], [None] * bs, []
-            for i, node in enumerate(leaf_nodes):
-                if node.board.is_game_over():
-                    res = node.board.result()
-                    if res == "1-0":
-                        v = 1.0 if root_board.turn == chess.WHITE else -1.0
-                    elif res == "0-1":
-                        v = -1.0 if root_board.turn == chess.WHITE else 1.0
-                    else:
-                        v = self.draw_penalty
-                    terminal_vals[i] = v
+            
+            boards_to_evaluate = []
+            terminal_values = []
+            terminal_draws = []
+            eval_index_map = []
+            
+            for idx, node in enumerate(leaf_nodes):
+                if self.is_terminal_for_training(node.board):
+                    terminal_values.append(self.terminal_value_for_side_to_move(node.board))
+                    terminal_draws.append(self.is_draw_result(node.board))
                 else:
-                    to_eval.append(node.board)
-                    eval_map.append(i)
+                    boards_to_evaluate.append(node.board)
+                    terminal_values.append(None)
+                    terminal_draws.append(False)
+                    eval_index_map.append(idx)
+            
+            if boards_to_evaluate:
+                eval_results = self.evaluate_batch(boards_to_evaluate)
+            else:
+                eval_results = []
+            
+            leaf_values = [None] * len(leaf_nodes)
+            for eval_idx, node_idx in enumerate(eval_index_map):
+                node = leaf_nodes[node_idx]
+                mv_probs, leaf_value = eval_results[eval_idx]
 
-            eval_results = self.evaluate_batch(to_eval) if to_eval else []
-            leaf_vals = list(terminal_vals)
-
-            for ei, ni in enumerate(eval_map):
-                node = leaf_nodes[ni]
-                mv_probs, lv = eval_results[ei]
-                prior_visits = game_position_counts.get(node.board.board_fen(), 0)
+                # Apply repetition penalty if this leaf position was already seen in the game.
+                # Penalty scales with how many times it has been visited, same as play_game.
+                prior_visits = self.repetition_count_for_board(node.board, game_position_counts)
                 if prior_visits >= 1:
-                    lv = float(np.clip(lv + self.repetition_penalty * prior_visits, -1.0, 1.0))
-                leaf_vals[ni] = lv
-                for m, prob in mv_probs:
-                    if m not in node.children:
-                        cb = node.board.copy(); cb.push(m)
-                        node.children[m] = self.MCTSNode(cb, parent=node, prior=prob)
+                    leaf_value = float(np.clip(
+                        leaf_value + self.repetition_penalty_for_visits(prior_visits), -1.0, 1.0
+                    ))
 
-            for path, lv in zip(search_paths, leaf_vals):
-                if lv is None:
+                leaf_values[node_idx] = leaf_value
+                for move, prob in mv_probs:
+                    if move not in node.children:
+                        b = node.board.copy()
+                        b.push(move)
+                        prior = float(prob) if np.isfinite(prob) and prob > 0.0 else 0.0
+                        node.children[move] = self.MCTSNode(b, parent=node, prior=prior)
+            
+            for idx, val in enumerate(terminal_values):
+                if val is not None:
+                    leaf_values[idx] = val
+            
+            for search_path, leaf_value, is_draw_leaf in zip(search_paths, leaf_values, terminal_draws):
+                if leaf_value is None:
                     continue
-                v = lv
-                for n in reversed(path):
-                    n.visits     += 1
-                    n.value_sum  += v
+                if is_draw_leaf:
+                    for n in reversed(search_path):
+                        n.visits += 1
+                        n.value_sum += leaf_value
+                        if n.virtual_loss_count > 0:
+                            n.virtual_loss_count -= 1
+                    continue
+                value_to_propagate = leaf_value
+                for n in reversed(search_path):
+                    n.visits += 1
+                    n.value_sum += value_to_propagate
                     if n.virtual_loss_count > 0:
                         n.virtual_loss_count -= 1
-                    v = -v
-
+                    value_to_propagate = -value_to_propagate
+        
         return root
+    
+    # -------------------------
+    # Move selection
+    # -------------------------
+    def mcts_policy_from_root(self, root, temperature=1.0):
+        if not root.children:
+            return [], [], np.array([], dtype=np.float64)
+        moves = list(root.children.keys())
+        visits = np.array([root.children[m].visits for m in moves], dtype=np.float64)
+        visits = np.nan_to_num(visits, nan=0.0, posinf=0.0, neginf=0.0)
+        visits = np.clip(visits, 0.0, None)
+        if visits.sum() <= 0:
+            visits = np.array([root.children[m].prior for m in moves], dtype=np.float64)
+            visits = np.nan_to_num(visits, nan=0.0, posinf=0.0, neginf=0.0)
+            visits = np.clip(visits, 0.0, None)
+            visits = self.normalize_probabilities(visits)
+        if temperature == 0 or temperature < 1e-8:
+            probs = np.zeros_like(visits)
+            probs[int(np.argmax(visits))] = 1.0
+        else:
+            probs = np.clip(visits, 1e-12, None) ** (1.0 / temperature)
+            probs = self.normalize_probabilities(probs)
+        return moves, visits, probs
 
-    # ─── Move selection ────────────────────────────────────────────────────────
-
-    def select_move(self,
-                    board: chess.Board,
-                    temperature: float = 1.0,
-                    use_mcts: bool = True,
-                    add_dirichlet_noise: bool = False,
-                    game_position_counts: dict = None,
-                    last_opponent_move: chess.Move = None):
-        """
-        Choose a move for the current position.
-
-        Parameters
-        ----------
-        last_opponent_move : chess.Move or None
-            The move the opponent just played.  When provided, the cached MCTS
-            tree is descended one level along this move before searching, so
-            the opponent's reply is handled as a tree-reuse step.
-        """
-        # ── Advance tree past the opponent's move (if any) ────────────────────
-        if last_opponent_move is not None:
-            reuse = self._advance_tree(last_opponent_move)
-            self._mcts_root = reuse   # may be None → cold start in MCTS
-
+    def select_move_with_policy(self, board, temperature=1.0, use_mcts=True,
+                                add_dirichlet_noise=False, game_position_counts=None):
+        flip = (board.turn == chess.BLACK)
         if not use_mcts:
-            # Fast path: raw policy network, no MCTS
             move_probs, _ = self.get_move_probabilities(board)
             if not move_probs:
-                return None
-            if temperature == 0:
-                return max(move_probs, key=lambda x: x[1])[0]
+                return None, ()
             moves, probs = zip(*move_probs)
-            probs = np.array(probs, dtype=np.float64)
-            probs = np.clip(probs, 1e-12, None) ** (1.0 / temperature)
-            probs /= probs.sum()
-            return np.random.choice(moves, p=probs)
+            probs = self.normalize_probabilities(probs)
+            selection_probs = self.avoid_repeated_position_probs(board, moves, probs, game_position_counts)
+            selection_probs = self.normalize_probabilities(selection_probs)
+            if temperature == 0 or temperature < 1e-8:
+                selected_idx = int(np.argmax(selection_probs))
+                train_probs = probs
+            else:
+                train_probs = probs ** (1.0 / temperature)
+                train_probs = self.normalize_probabilities(train_probs)
+                selected_idx = self.safe_choice_index(len(moves), selection_probs)
+            policy_target = tuple(
+                (self.move_to_index(move, flip=flip), float(prob))
+                for move, prob in zip(moves, train_probs)
+                if prob > 0.0
+            )
+            return moves[selected_idx], policy_target
 
-        # ── MCTS search (with optional tree reuse) ────────────────────────────
-        root = self.run_mcts_batched(
-            board,
-            simulations=self.mcts_simulations,
-            add_dirichlet_noise=add_dirichlet_noise,
-            game_position_counts=game_position_counts,
-            root_node=self._mcts_root,
+        root = self.run_mcts_batched(board, simulations=self.mcts_simulations,
+                                     add_dirichlet_noise=add_dirichlet_noise,
+                                     game_position_counts=game_position_counts)
+        moves, _, probs = self.mcts_policy_from_root(root, temperature=temperature)
+        if not moves:
+            return None, ()
+        mcts_policy_probs = probs
+        selection_probs = self.avoid_repeated_position_probs(board, moves, mcts_policy_probs, game_position_counts)
+        selection_probs = self.normalize_probabilities(selection_probs)
+        selected_idx = self.safe_choice_index(len(moves), selection_probs)
+        policy_target = tuple(
+            (self.move_to_index(move, flip=flip), float(prob))
+            for move, prob in zip(moves, mcts_policy_probs)
+            if prob > 0.0
         )
+        return moves[selected_idx], policy_target
 
-        if not root.children:
-            self._mcts_root = None
-            return None
-
-        moves  = list(root.children.keys())
-        visits = np.array([root.children[m].visits for m in moves], dtype=np.float64)
-
-        if temperature == 0 or temperature < 1e-8:
-            move = moves[int(np.argmax(visits))]
-        else:
-            probs = visits ** (1.0 / temperature)
-            probs /= probs.sum()
-            move  = np.random.choice(moves, p=probs)
-
-        # ── Advance the cache to the chosen child for the *next* call ─────────
-        child = root.children.get(move)
-        if child is not None:
-            child.parent = None          # detach; let old siblings be GC'd
-            self._mcts_root = child
-        else:
-            self._mcts_root = None
-
+    def select_move(self, board, temperature=1.0, use_mcts=True, add_dirichlet_noise=False, game_position_counts=None):
+        move, _ = self.select_move_with_policy(
+            board,
+            temperature=temperature,
+            use_mcts=use_mcts,
+            add_dirichlet_noise=add_dirichlet_noise,
+            game_position_counts=game_position_counts
+        )
         return move
-
-    # ─── Self-play ─────────────────────────────────────────────────────────────
-
-    def play_game(self, temperature: float = 1.0,
-                  max_moves: int = 300, temp_threshold: int = 30):
+    
+    # -------------------------
+    # Self-play with repetition-aware search
+    # -------------------------
+    def play_game(self, temperature=1.0, max_moves=200, temp_threshold=30):
         """
-        Play a self-play game with tree reuse across every ply.
+        Play a self-play game.
 
-        Each side's MCTS root from the previous ply is carried forward:
-        - After White plays move M, the child node for M becomes the starting
-          root for Black's search (which now only needs extra simulations, not
-          a full cold-start).
-        - After Black plays move N, the child node for N becomes the starting
-          root for White's next search, and so on.
+        Repetition pressure is applied during MCTS selection only. Stored policy
+        targets stay as MCTS visit counts, and value targets stay tied to the
+        actual game result.
         """
         board = chess.Board()
         game_data = []
         move_count = 0
-        position_counts: dict = {}
 
-        # One cached root per side; both start cold
-        reuse_root = None
+        # Track exact positions and piece layouts. Layout repeats catch shuffling
+        # cycles even when side-to-move, castling, or en-passant state differs.
+        position_counts = self.new_repetition_tracker()
 
-        while not board.is_game_over() and not self.stop_training_flag:
-            fen_key     = board.board_fen()
-            visit_count = position_counts.get(fen_key, 0)
-            position_counts[fen_key] = visit_count + 1
-
-            inline_penalty = 0.0
-            if visit_count >= 1:
-                inline_penalty = self.repetition_penalty * visit_count
+        while not self.is_terminal_for_training(board) and not self.stop_training_flag:
+            visit_count = self.repetition_count_for_board(board, position_counts)
+            self.record_position_visit(board, position_counts)
+            if visit_count > 0:
                 self.training_stats['repetition_penalties_applied'] += 1
 
+            can_flip = self.is_position_symmetric_safe(board)
             board_tensor = self.board_to_tensor(board).cpu()
+            legal_indices = self.legal_policy_indices(board)
 
-            # ── Run MCTS, reusing the subtree from two plies ago ──────────────
-            root = self.run_mcts_batched(
+            current_temp = temperature if move_count < temp_threshold else 0.0
+            move, policy_target = self.select_move_with_policy(
                 board,
-                simulations=self.mcts_simulations,
+                temperature=current_temp,
+                use_mcts=True,
                 add_dirichlet_noise=True,
-                game_position_counts=position_counts,
-                root_node=reuse_root,
+                game_position_counts=position_counts
             )
-            if not root.children:
+
+            if move is None:
                 break
 
-            moves  = list(root.children.keys())
-            visits = np.array([root.children[m].visits for m in moves], dtype=np.float64)
+            player = board.turn
+            destination_penalty = self.move_into_repetition_penalty(board, move, position_counts)
+            if destination_penalty < 0.0:
+                self.training_stats['repetition_penalties_applied'] += 1
 
-            flip = (board.turn == chess.BLACK)
-
-            # Build 4096-dim policy target from visit counts
-            visit_dist = np.zeros(4096, dtype=np.float32)
-            for m, v in zip(moves, visits):
-                idx = self.move_to_index(m, flip=flip)
-                if idx < 4096:
-                    visit_dist[idx] = float(v)
-            total = visit_dist.sum()
-            if total > 0:
-                visit_dist /= total
-
-            # ── Sample move ───────────────────────────────────────────────────
-            current_temp = temperature if move_count < temp_threshold else 0.0
-            if current_temp < 1e-8:
-                move = moves[int(np.argmax(visits))]
-            else:
-                probs = visits ** (1.0 / current_temp)
-                probs /= probs.sum()
-                move  = np.random.choice(moves, p=probs)
-
-            can_flip = self.is_move_augmentable(board, move)
-            player   = board.turn
-
-            game_data.append((board_tensor, visit_dist, player, can_flip, inline_penalty))
-
-            # ── Advance reuse root for the *opponent's* next search ───────────
-            # The opponent will search from the child of the current root
-            # corresponding to the move we just played.  That child has already
-            # accumulated simulations from our search, giving it a warm start.
-            child = root.children.get(move)
-            if child is not None:
-                child.parent = None      # detach from the rest of the old tree
-                reuse_root = child
-            else:
-                reuse_root = None
-
+            game_data.append((board_tensor, policy_target, legal_indices, player, can_flip, 0.0, None, 1.0))
             board.push(move)
             move_count += 1
 
             if len(game_data) > max_moves:
                 break
 
-        # ── Game outcome ──────────────────────────────────────────────────────
-        result = board.result()
-        if result == "1-0":
+        # Assign end-of-game reward
+        outcome = board.outcome(claim_draw=True)
+        if outcome and outcome.winner == chess.WHITE:
             reward = 1.0
             self.training_stats['white_wins'] += 1
-        elif result == "0-1":
+        elif outcome and outcome.winner == chess.BLACK:
             reward = -1.0
             self.training_stats['black_wins'] += 1
         else:
-            reward = self.draw_penalty
+            reward = self.draw_value_for_board(board)
             self.training_stats['draws'] += 1
+            if len(game_data) > max_moves:
+                self.training_stats['max_move_draws'] += 1
+                self.training_stats['last_draw_reason'] = 'max moves'
+            else:
+                self.training_stats['rule_draws'] += 1
+                self.training_stats['last_draw_reason'] = outcome.termination.name.lower() if outcome else 'unknown'
 
         self.training_stats['games_played'] += 1
-        self.training_stats['total_moves']  += len(game_data)
+        self.training_stats['total_moves'] += len(game_data)
+        self.training_stats['last_game_moves'] = len(game_data)
+
         return game_data, reward
 
-    # ─── Replay buffer ─────────────────────────────────────────────────────────
+    def play_stockfish_teacher_game(self, temperature=1.0, max_moves=200, temp_threshold=30):
+        """
+        Generate one teacher game using Stockfish policy/value targets.
 
-    def add_game_to_buffer(self, game_data, reward: float):
-        for board_tensor, visit_dist, player, can_flip, inline_penalty in game_data:
-            base_value   = reward if player == chess.WHITE else -reward
-            target_value = float(np.clip(base_value + inline_penalty, -0.95, 0.95))
+        The engine provides the training target; repetition penalties are used
+        only when sampling the played move from the teacher distribution.
+        """
+        board = chess.Board()
+        game_data = []
+        move_count = 0
+        position_counts = self.new_repetition_tracker()
 
-            pairs = self.augment(board_tensor, visit_dist, can_flip)
+        while not self.is_terminal_for_training(board) and not self.stop_training_flag:
+            self.record_position_visit(board, position_counts)
+            teacher = self.stockfish_policy_value(board)
+            if teacher is None:
+                self.training_stats['stockfish_unavailable_games'] = (
+                    self.training_stats.get('stockfish_unavailable_games', 0) + 1
+                )
+                return self.play_game(temperature, max_moves=max_moves, temp_threshold=temp_threshold)
+
+            move_probs, teacher_value = teacher
+            moves, probs = zip(*move_probs)
+            current_temp = temperature if move_count < temp_threshold else 0.0
+            if current_temp == 0 or current_temp < 1e-8:
+                selection_probs = np.zeros(len(moves), dtype=np.float64)
+                selection_probs[int(np.argmax(probs))] = 1.0
+            else:
+                selection_probs = np.asarray(probs, dtype=np.float64) ** (1.0 / current_temp)
+                selection_probs = self.normalize_probabilities(selection_probs)
+
+            selection_probs = self.avoid_repeated_position_probs(board, moves, selection_probs, position_counts)
+            selection_probs = self.normalize_probabilities(selection_probs)
+            selected_idx = self.safe_choice_index(len(moves), selection_probs)
+            move = moves[selected_idx]
+
+            can_flip = self.is_position_symmetric_safe(board)
+            board_tensor = self.board_to_tensor(board).cpu()
+            legal_indices = self.legal_policy_indices(board)
+            policy_target = self.move_probs_to_policy_target(board, move_probs)
+            player = board.turn
+            game_data.append((board_tensor, policy_target, legal_indices, player, can_flip, 0.0, teacher_value, 1.0))
+
+            board.push(move)
+            move_count += 1
+            if len(game_data) > max_moves:
+                break
+
+        outcome = board.outcome(claim_draw=True)
+        if outcome and outcome.winner == chess.WHITE:
+            reward = 1.0
+            self.training_stats['white_wins'] += 1
+        elif outcome and outcome.winner == chess.BLACK:
+            reward = -1.0
+            self.training_stats['black_wins'] += 1
+        else:
+            reward = self.draw_value_for_board(board)
+            self.training_stats['draws'] += 1
+            if len(game_data) > max_moves:
+                self.training_stats['max_move_draws'] += 1
+                self.training_stats['last_draw_reason'] = 'max moves'
+            else:
+                self.training_stats['rule_draws'] += 1
+                self.training_stats['last_draw_reason'] = outcome.termination.name.lower() if outcome else 'unknown'
+
+        self.training_stats['games_played'] += 1
+        self.training_stats['total_moves'] += len(game_data)
+        self.training_stats['last_game_moves'] = len(game_data)
+        self.training_stats['stockfish_games'] = self.training_stats.get('stockfish_games', 0) + 1
+        self.training_stats['stockfish_positions'] = (
+            self.training_stats.get('stockfish_positions', 0) + len(game_data)
+        )
+
+        return game_data, reward
+
+    # -------------------------
+    # Replay buffer
+    # -------------------------
+    def unpack_game_position(self, entry):
+        board_tensor, policy_target, legal_indices, player, can_flip = entry[:5]
+        inline_penalty = entry[5] if len(entry) > 5 else 0.0
+        value_override = entry[6] if len(entry) > 6 else None
+        policy_weight = entry[7] if len(entry) > 7 else 1.0
+        return board_tensor, policy_target, legal_indices, player, can_flip, inline_penalty, value_override, policy_weight
+
+    def initial_replay_priority(self, policy_target, target_value):
+        policy_indices, policy_probs = policy_target
+        if torch.is_tensor(policy_probs) and policy_probs.numel() > 1:
+            probs = policy_probs.float().clamp_min(1e-12)
+            entropy = float(-(probs * probs.log()).sum().item())
+            max_entropy = math.log(float(policy_probs.numel()))
+            sharpness = max(0.0, 1.0 - entropy / max(max_entropy, 1e-12))
+        else:
+            sharpness = 1.0
+        return float(self.priority_epsilon + 1.0 + abs(float(target_value)) + sharpness)
+
+    def unpack_replay_entry(self, entry):
+        if len(entry) >= 7:
+            board_tensor, policy_target, legal_indices, target_value, age_marker, priority, policy_weight = entry[:7]
+            return board_tensor, policy_target, legal_indices, target_value, age_marker, float(priority), float(policy_weight)
+        if len(entry) == 6:
+            board_tensor, policy_target, legal_indices, target_value, age_marker, priority = entry
+            return board_tensor, policy_target, legal_indices, target_value, age_marker, float(priority), 1.0
+        board_tensor, policy_target, legal_indices, target_value, age_marker = entry
+        priority = self.initial_replay_priority(policy_target, target_value)
+        return board_tensor, policy_target, legal_indices, target_value, age_marker, priority, 1.0
+
+    def make_replay_entry(self, board_tensor, policy_target, legal_indices, target_value, age_marker, priority, policy_weight):
+        return (
+            board_tensor,
+            policy_target,
+            legal_indices,
+            float(target_value),
+            age_marker,
+            float(max(priority, self.priority_epsilon)),
+            float(np.clip(policy_weight, 0.0, 1.0)),
+        )
+
+    def sample_replay_indices(self):
+        size = len(self.replay_buffer)
+        if size == 0:
+            return []
+
+        sample_count = self.batch_size
+        replace = size < sample_count
+        if self.prioritized_replay_alpha <= 0:
+            if replace:
+                return [random.randrange(size) for _ in range(sample_count)]
+            return random.sample(range(size), sample_count)
+
+        priorities = []
+        for entry in self.replay_buffer:
+            *_, priority, _ = self.unpack_replay_entry(entry)
+            priorities.append(max(float(priority), self.priority_epsilon))
+        weights = np.asarray(priorities, dtype=np.float64) ** self.prioritized_replay_alpha
+        probs = self.normalize_probabilities(weights)
+        return np.random.choice(size, size=sample_count, replace=replace, p=probs).astype(int).tolist()
+
+    def update_replay_priorities(self, sampled_indices, sample_errors):
+        if sample_errors is None:
+            return
+        for idx, error in zip(sampled_indices, sample_errors):
+            if idx < 0 or idx >= len(self.replay_buffer):
+                continue
+            board_tensor, policy_target, legal_indices, target_value, age_marker, _, policy_weight = self.unpack_replay_entry(
+                self.replay_buffer[idx]
+            )
+            priority = float(abs(error)) + self.priority_epsilon
+            self.replay_buffer[idx] = self.make_replay_entry(
+                board_tensor,
+                policy_target,
+                legal_indices,
+                target_value,
+                age_marker,
+                priority,
+                policy_weight
+            )
+
+    def add_game_to_buffer(self, game_data, reward):
+        """
+        Add game to replay buffer.
+
+        Value targets are the game outcome from the player's perspective unless
+        a teacher value override is provided.
+        """
+        is_draw = self.is_draw_reward(reward)
+
+        for position_entry in game_data:
+            board_tensor_cpu, policy_target, legal_indices, player, can_flip, _inline_penalty, value_override, policy_weight = (
+                self.unpack_game_position(position_entry)
+            )
+            if not policy_target:
+                continue
+
+            # Convert game outcome to this player's perspective
+            if value_override is not None:
+                target_value = float(np.clip(value_override, -1.0, 1.0))
+            elif is_draw:
+                base_value = reward
+            elif player == chess.WHITE:
+                base_value = reward
+            else:
+                base_value = -reward
+
+            if value_override is None:
+                target_value = float(np.clip(base_value, -1.0, 1.0))
+
+            augmented = self.augment_training_entry(board_tensor_cpu, policy_target, legal_indices, can_flip)
 
             self.training_stats['positions_total'] += 1
             if can_flip:
                 self.training_stats['positions_flipped'] += 1
 
-            for aug_tensor, aug_dist in pairs:
-                self.replay_buffer.append((
+            for aug_tensor, aug_policy_target, aug_legal_indices in augmented:
+                compact_policy, compact_legal = self.compact_training_targets(
+                    aug_policy_target,
+                    aug_legal_indices
+                )
+                priority = self.initial_replay_priority(compact_policy, target_value)
+                self.replay_buffer.append(self.make_replay_entry(
                     aug_tensor,
-                    aug_dist,
+                    compact_policy,
+                    compact_legal,
                     target_value,
                     self.data_counter,
+                    priority,
+                    policy_weight
                 ))
-            self.data_counter += 1
 
+            self.data_counter += 1
+    
     def clean_old_data(self):
         if len(self.replay_buffer) < self.replay_capacity:
             return
-        cutoff = self.data_counter - self.max_data_age
-        new_buf = deque(maxlen=self.replay_capacity)
+        current_counter = self.data_counter
+        new_buffer = deque(maxlen=self.replay_capacity)
         for entry in self.replay_buffer:
-            if entry[3] >= cutoff:
-                new_buf.append(entry)
-        self.replay_buffer = new_buf
-
+            board_tensor, policy_target, legal_indices, target_value, age_marker, priority, policy_weight = (
+                self.unpack_replay_entry(entry)
+            )
+            if current_counter - age_marker < self.max_data_age:
+                new_buffer.append(self.make_replay_entry(
+                    board_tensor,
+                    policy_target,
+                    legal_indices,
+                    target_value,
+                    age_marker,
+                    priority,
+                    policy_weight
+                ))
+        self.replay_buffer = new_buffer
+    
     def sample_batch(self):
-        if not self.replay_buffer:
+        if len(self.replay_buffer) == 0:
             raise ValueError("Replay buffer is empty")
-        batch = random.sample(self.replay_buffer,
-                              min(self.batch_size, len(self.replay_buffer)))
-        if len(batch) < self.batch_size:
-            batch = [random.choice(self.replay_buffer) for _ in range(self.batch_size)]
-
-        boards, visit_dists, target_values, _ = zip(*batch)
-
-        boards_t  = torch.cat(boards, dim=0).to(self.device)
+        sampled_indices = self.sample_replay_indices()
+        batch = [self.unpack_replay_entry(self.replay_buffer[idx]) for idx in sampled_indices]
+        boards, policy_targets, legal_indices_batch, target_values, _, _, policy_weights = zip(*batch)
+        boards_tensor = torch.cat(boards, dim=0).to(self.device)
         if self.device.type == 'cuda':
-            boards_t = boards_t.to(memory_format=torch.channels_last)
+            boards_tensor = boards_tensor.to(memory_format=torch.channels_last)
 
-        vd_t  = torch.from_numpy(np.stack(visit_dists, axis=0)).to(self.device)
-        val_t = torch.FloatTensor(target_values).to(self.device)
+        batch_len = len(policy_targets)
+        policy_targets_tensor = torch.zeros(
+            (batch_len, 4096),
+            dtype=torch.float32,
+            device=self.device
+        )
+        legal_mask_tensor = torch.zeros(
+            (batch_len, 4096),
+            dtype=torch.bool,
+            device=self.device
+        )
 
-        return boards_t, vd_t, val_t
+        policy_row_parts = []
+        policy_col_parts = []
+        policy_val_parts = []
+        legal_row_parts = []
+        legal_col_parts = []
 
-    # ─── Training ──────────────────────────────────────────────────────────────
+        for row, (policy_target, legal_indices) in enumerate(zip(policy_targets, legal_indices_batch)):
+            # Older in-memory entries may still be tuple lists if training was already running.
+            if (
+                isinstance(policy_target, tuple)
+                and len(policy_target) == 2
+                and torch.is_tensor(policy_target[0])
+            ):
+                policy_indices, policy_probs = policy_target
+            else:
+                policy_target, legal_indices = self.compact_training_targets(
+                    policy_target,
+                    legal_indices
+                )
+                policy_indices, policy_probs = policy_target
 
-    def train_on_batch(self, boards_t, visit_dists_t, target_values_t):
+            if not torch.is_tensor(legal_indices):
+                _, legal_indices = self.compact_training_targets((), legal_indices)
+
+            if policy_indices.numel() > 0:
+                policy_row_parts.append(torch.full_like(policy_indices, row))
+                policy_col_parts.append(policy_indices)
+                policy_val_parts.append(policy_probs)
+            if legal_indices.numel() > 0:
+                legal_row_parts.append(torch.full_like(legal_indices, row))
+                legal_col_parts.append(legal_indices)
+
+        if policy_row_parts:
+            policy_rows = torch.cat(policy_row_parts).to(self.device)
+            policy_cols = torch.cat(policy_col_parts).to(self.device)
+            policy_vals = torch.cat(policy_val_parts).to(self.device)
+            policy_targets_tensor.index_put_(
+                (policy_rows, policy_cols),
+                policy_vals,
+                accumulate=True
+            )
+
+        if legal_row_parts:
+            legal_rows = torch.cat(legal_row_parts).to(self.device)
+            legal_cols = torch.cat(legal_col_parts).to(self.device)
+            legal_mask_tensor[legal_rows, legal_cols] = True
+
+        row_sums = policy_targets_tensor.sum(dim=1, keepdim=True)
+        policy_targets_tensor = torch.where(
+            row_sums > 0,
+            policy_targets_tensor / row_sums.clamp_min(1e-12),
+            policy_targets_tensor
+        )
+        target_values_tensor = torch.tensor(
+            target_values,
+            dtype=torch.float32,
+            device=self.device
+        )
+        policy_weights_tensor = torch.tensor(
+            policy_weights,
+            dtype=torch.float32,
+            device=self.device
+        )
+        return boards_tensor, policy_targets_tensor, legal_mask_tensor, target_values_tensor, policy_weights_tensor, sampled_indices
+    
+    # -------------------------
+    # Training
+    # -------------------------
+    def train_on_batch(self, boards_tensor, policy_targets_tensor, legal_mask_tensor,
+                       target_values_tensor, policy_weights_tensor=None):
         self.model.train()
         with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-            policy_logits, values = self.model(boards_t)
-
-            log_probs = F.log_softmax(policy_logits, dim=1)
-
-            policy_loss = -(visit_dists_t * log_probs).sum(dim=1).mean()
-
-            value_loss  = F.mse_loss(values, target_values_t)
-
-            probs   = torch.softmax(policy_logits, dim=1)
-            entropy = -(probs * log_probs).sum(dim=1).mean()
-
-            adaptive_ent = self.entropy_coef * (
-                1.0 + 0.1 / (1.0 + self.training_stats['total_training_steps'] / 1000.0)
+            policy_logits, values = self.model(boards_tensor)
+            policy_logits = torch.nan_to_num(
+                policy_logits.float(),
+                nan=0.0,
+                posinf=1e4,
+                neginf=-1e4
             )
-            loss = policy_loss + self.value_coef * value_loss - adaptive_ent * entropy
-
+            values = torch.nan_to_num(
+                values.float(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0
+            )
+            masked_logits = policy_logits.masked_fill(
+                ~legal_mask_tensor,
+                self.invalid_policy_logit(policy_logits)
+            )
+            log_probs = F.log_softmax(masked_logits, dim=1)
+            per_policy_loss = -(policy_targets_tensor * log_probs).sum(dim=1)
+            if policy_weights_tensor is None:
+                policy_weights_tensor = torch.ones_like(per_policy_loss)
+            policy_weights_tensor = policy_weights_tensor.clamp(0.0, 1.0)
+            policy_loss = (
+                per_policy_loss * policy_weights_tensor
+            ).sum() / policy_weights_tensor.sum().clamp_min(1e-6)
+            per_value_loss = F.mse_loss(values, target_values_tensor, reduction='none')
+            value_loss = per_value_loss.mean()
+            probs = F.softmax(masked_logits, dim=1)
+            entropy = -(probs * log_probs).sum(dim=1).mean()
+            adaptive_entropy_coef = self.entropy_coef * (1.0 + 0.1 / (1.0 + self.training_stats['total_training_steps'] / 1000.0))
+            loss = policy_loss + self.value_coef * value_loss - adaptive_entropy_coef * entropy
+            sample_errors = (
+                per_policy_loss.detach() * policy_weights_tensor.detach()
+                + self.value_coef * per_value_loss.detach()
+            )
+        
         if not torch.isfinite(loss):
-            return float('nan'), float('nan')
-
+            return float('nan'), float('nan'), None
+        
         self.optimizer.zero_grad()
         if self.use_amp:
             self.scaler.scale(loss).backward()
@@ -824,126 +1473,180 @@ class ChessAI:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
             self.optimizer.step()
-
-        self.loss_history.append(policy_loss.item())
+        
+        try:
+            self.loss_history.append(policy_loss.item())
+        except:
+            self.loss_history.append(0.0)
+        
         self.training_stats['total_training_steps'] += 1
         try:
             self.scheduler.step()
         except Exception:
             pass
+        
+        return policy_loss.item(), value_loss.item(), sample_errors.float().cpu().numpy()
 
-        return policy_loss.item(), value_loss.item()
+    def train_from_replay(self, steps=None, require_min_buffer=True):
+        if steps is None:
+            steps = self.train_steps_per_game
+        if steps <= 0 or len(self.replay_buffer) == 0:
+            return 0.0, 0.0, 0, 0.0
+        if require_min_buffer and len(self.replay_buffer) < max(self.min_buffer_size, self.batch_size):
+            return 0.0, 0.0, 0, 0.0
 
-    def train(self, num_games: int = 10, temperature: float = 1.0,
-              temp_threshold: int = 30, callback=None):
+        avg_policy_loss = 0.0
+        avg_value_loss = 0.0
+        steps_done = 0
+        train_start = time.time()
+
+        for _ in range(steps):
+            try:
+                boards, policy_targets, legal_mask, values, policy_weights, sampled_indices = self.sample_batch()
+            except ValueError:
+                break
+            p_loss, v_loss, sample_errors = self.train_on_batch(
+                boards,
+                policy_targets,
+                legal_mask,
+                values,
+                policy_weights
+            )
+            if p_loss != p_loss or v_loss != v_loss:
+                continue
+            self.update_replay_priorities(sampled_indices, sample_errors)
+            avg_policy_loss += p_loss
+            avg_value_loss += v_loss
+            steps_done += 1
+
+        train_time = time.time() - train_start
+        if steps_done > 0:
+            avg_policy_loss /= steps_done
+            avg_value_loss /= steps_done
+        return avg_policy_loss, avg_value_loss, steps_done, train_time
+    
+    def train(self, num_games=10, temperature=1.0, temp_threshold=30, callback=None):
         self.stop_training_flag = False
-
+        
         for game_num in range(num_games):
             if self.stop_training_flag:
                 break
-
-            t0 = time.time()
-            game_data, reward = self.play_game(temperature, temp_threshold=temp_threshold)
-            game_time = time.time() - t0
-
+            
+            game_start = time.time()
+            if self.should_use_stockfish_teacher():
+                game_data, reward = self.play_stockfish_teacher_game(
+                    temperature,
+                    temp_threshold=temp_threshold
+                )
+            else:
+                game_data, reward = self.play_game(temperature, temp_threshold=temp_threshold)
+            game_time = time.time() - game_start
+            
             self.add_game_to_buffer(game_data, reward)
+            
             if game_num % 10 == 0:
                 self.clean_old_data()
-
-            p_loss_avg = v_loss_avg = 0.0
-            steps = 0
-            t1 = time.time()
-
-            if len(self.replay_buffer) >= max(self.min_buffer_size, self.batch_size):
-                for _ in range(self.train_steps_per_game):
-                    try:
-                        b, vd, tv = self.sample_batch()
-                    except ValueError:
-                        break
-                    pl, vl = self.train_on_batch(b, vd, tv)
-                    if math.isnan(pl):
-                        continue
-                    p_loss_avg += pl
-                    v_loss_avg += vl
-                    steps += 1
-                if steps:
-                    p_loss_avg /= steps
-                    v_loss_avg /= steps
-
-            train_time = time.time() - t1
-
+            
+            avg_policy_loss, avg_value_loss, steps_done, train_time = self.train_from_replay(
+                steps=self.train_steps_per_game,
+                require_min_buffer=True
+            )
+            self.training_stats['total_game_time'] += game_time
+            self.training_stats['total_train_time'] += train_time
+            self.training_stats['last_game_time'] = game_time
+            self.training_stats['last_train_time'] = train_time
+            
             if callback:
-                callback(game_num + 1, num_games, p_loss_avg, v_loss_avg,
-                         reward, game_time, train_time)
+                callback(game_num + 1, num_games, avg_policy_loss, avg_value_loss, reward, game_time, train_time)
+            
             if (game_num + 1) % 10 == 0:
                 self.save_model()
-
+    
     def stop_training(self):
         self.stop_training_flag = True
-
-    # ─── Save / Load ───────────────────────────────────────────────────────────
-
+    
+    # -------------------------
+    # Save / Load
+    # -------------------------
     def save_model(self):
-        path = os.path.join(self.save_dir, "model_latest.pth")
+        model_path = os.path.join(self.save_dir, "model_latest.pth")
         try:
             cpu_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
-            d = {
-                'model_state_dict':     cpu_state,
-                'training_stats':       self.training_stats,
+            save_dict = {
+                'model_state_dict': cpu_state,
+                'training_stats': self.training_stats,
                 'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'arch_version':         3,
+                'scheduler_state_dict': self.scheduler.state_dict()
             }
             if self.scaler:
-                d['scaler_state_dict'] = self.scaler.state_dict()
-            torch.save(d, path)
+                save_dict['scaler_state_dict'] = self.scaler.state_dict()
+            torch.save(save_dict, model_path)
             if self.training_stats['games_played'] % 50 == 0:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                torch.save(d, os.path.join(self.save_dir, f"model_{ts}.pth"))
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = os.path.join(self.save_dir, f"model_{timestamp}.pth")
+                torch.save(save_dict, backup_path)
         except Exception as e:
             print(f"Error saving model: {e}")
-
+    
     def load_model(self):
-        path = os.path.join(self.save_dir, "model_latest.pth")
-        if not os.path.exists(path):
+        model_path = os.path.join(self.save_dir, "model_latest.pth")
+        if os.path.exists(model_path):
+            try:
+                checkpoint = torch.load(model_path, map_location='cpu')
+                saved_state = checkpoint['model_state_dict']
+                current_state = self.model.state_dict()
+                incompatible = [
+                    key for key, value in saved_state.items()
+                    if key in current_state and current_state[key].shape != value.shape
+                ]
+                missing = [key for key in current_state.keys() if key not in saved_state]
+                unexpected = [key for key in saved_state.keys() if key not in current_state]
+                if incompatible or missing or unexpected:
+                    reason = (
+                        incompatible[0] if incompatible else
+                        missing[0] if missing else
+                        unexpected[0]
+                    )
+                    print(f"Saved model is incompatible with current architecture ({reason}). Starting fresh.")
+                    return
+                self.model.load_state_dict(saved_state)
+                self.model.to(self.device)
+                if self.device.type == 'cuda':
+                    self.model = self.model.to(memory_format=torch.channels_last)
+                self.training_stats = checkpoint.get('training_stats', self.training_stats)
+                # Backwards compatibility
+                for key, default in self.new_training_stats().items():
+                    if key not in self.training_stats:
+                        self.training_stats[key] = default
+                if 'optimizer_state_dict' in checkpoint:
+                    try:
+                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    except ValueError:
+                        print("Optimizer state is incompatible. Using a fresh optimizer.")
+                if 'scheduler_state_dict' in checkpoint:
+                    try:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    except Exception:
+                        print("Scheduler state is incompatible. Using a fresh scheduler.")
+                if self.scaler and 'scaler_state_dict' in checkpoint:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                print(f"Model loaded from {model_path}")
+                print(f"Stats: {self.training_stats}")
+            except Exception as e:
+                print(f"Error loading model: {e}")
+        else:
             print("No saved model found. Starting fresh.")
-            return
-        try:
-            ckpt = torch.load(path, map_location='cpu')
-            if ckpt.get('arch_version', 1) < 3:
-                print("Saved model is from an older architecture. Starting fresh.")
-                return
-            self.model.load_state_dict(ckpt['model_state_dict'])
-            self.model.to(self.device)
-            if self.device.type == 'cuda':
-                self.model = self.model.to(memory_format=torch.channels_last)
-            self.training_stats = ckpt.get('training_stats', self.training_stats)
-            for k in ['positions_flipped', 'positions_total',
-                      'total_training_steps', 'repetition_penalties_applied',
-                      'tree_reuse_hits', 'tree_reuse_misses']:
-                self.training_stats.setdefault(k, 0)
-            if 'optimizer_state_dict' in ckpt:
-                self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            if 'scheduler_state_dict' in ckpt:
-                self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            if self.scaler and 'scaler_state_dict' in ckpt:
-                self.scaler.load_state_dict(ckpt['scaler_state_dict'])
-            print(f"Model loaded from {path}")
-            print(f"Stats: {self.training_stats}")
-        except Exception as e:
-            print(f"Error loading model: {e}. Starting fresh.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
 # GUI
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -------------------------
 class ChessGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("Chess AI v4 — Tree Reuse + SE-ResNet + AlphaZero Training")
+        self.window.title("Chess AI - Stockfish Teacher")
         self.window.geometry("1000x800")
-
+        
         self.ai = ChessAI()
         self.board = chess.Board()
         self.selected_square = None
@@ -953,177 +1656,436 @@ class ChessGUI:
         self.training_thread = None
         self.square_size = 60
         self.move_history = []
+        self.last_move = None
         self.ai_thinking = False
         self.flip_board = False
         self.flip_var = tk.BooleanVar(value=False)
         self.message_queue = queue.Queue()
         self.ai_vs_ai_running = False
         self.ai_vs_ai_paused = False
-
-        # Track the last move played (for tree reuse in human vs AI games)
-        self._last_human_move: chess.Move | None = None
-
+        self.player_vs_player_mode = False
+        self.learn_from_human_var = tk.BooleanVar(value=True)
+        self.human_game_data = []
+        self.human_position_counts = self.ai.new_repetition_tracker()
+        self.human_game_start_time = None
+        
         self.setup_gui()
         self.process_queue()
+        
+    def configure_style(self):
+        self.colors = {
+            'app_bg': '#ece7dc',
+            'panel_bg': '#f7f3ea',
+            'panel_border': '#cfc5b4',
+            'text': '#1f2620',
+            'muted': '#667164',
+            'accent': '#2d6a4f',
+            'accent_dark': '#1b4332',
+            'danger': '#9d2f2f',
+            'board_edge': '#3d3a32',
+            'light_square': '#e8d8b8',
+            'dark_square': '#769656',
+            'selected_square': '#f5d76e',
+            'last_move': '#b9c86b',
+            'legal_move': '#244f35',
+            'check': '#d85c4a',
+            'text_bg': '#fffdf7',
+        }
+        self.window.configure(bg=self.colors['app_bg'])
+        style = ttk.Style(self.window)
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+
+        base_font = ('Segoe UI', 10)
+        heading_font = ('Segoe UI', 12, 'bold')
+        title_font = ('Segoe UI', 18, 'bold')
+        self.window.option_add('*Font', base_font)
+
+        style.configure('TFrame', background=self.colors['panel_bg'])
+        style.configure('App.TFrame', background=self.colors['app_bg'])
+        style.configure('Panel.TFrame', background=self.colors['panel_bg'])
+        style.configure('Header.TFrame', background=self.colors['accent_dark'])
+        style.configure('Card.TLabelframe', background=self.colors['panel_bg'])
+        style.configure('Card.TLabelframe.Label', background=self.colors['panel_bg'], foreground=self.colors['text'], font=heading_font)
+        style.configure('TLabel', background=self.colors['panel_bg'], foreground=self.colors['text'])
+        style.configure('Header.TLabel', background=self.colors['accent_dark'], foreground='#fffdf7', font=title_font)
+        style.configure('HeaderMeta.TLabel', background=self.colors['accent_dark'], foreground='#dce8d7')
+        style.configure('Muted.TLabel', background=self.colors['panel_bg'], foreground=self.colors['muted'])
+        style.configure('Value.TLabel', background=self.colors['panel_bg'], foreground=self.colors['accent_dark'], font=('Segoe UI', 10, 'bold'))
+        style.configure('Status.TLabel', background='#ded7c8', foreground=self.colors['text'], padding=(10, 6))
+        style.configure('TEntry', fieldbackground='#fffdf7', foreground=self.colors['text'], padding=4)
+        style.configure('TButton', padding=(10, 6))
+        style.configure('Accent.TButton', background=self.colors['accent'], foreground='white')
+        style.map('Accent.TButton', background=[('active', self.colors['accent_dark']), ('disabled', '#94a99a')])
+        style.configure('Danger.TButton', background=self.colors['danger'], foreground='white')
+        style.map('Danger.TButton', background=[('active', '#7d2424'), ('disabled', '#c9aaaa')])
+        style.configure('TNotebook', background=self.colors['app_bg'], borderwidth=0)
+        style.configure('TNotebook.Tab', padding=(14, 7), font=('Segoe UI', 10, 'bold'))
 
     def setup_gui(self):
-        main_frame = ttk.Frame(self.window, padding="10")
+        self.configure_style()
+        self.window.title("Chess AI Self-Play Lab")
+        self.window.geometry("1180x840")
+        self.window.minsize(1040, 720)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+
+        main_frame = ttk.Frame(self.window, padding=14, style='App.TFrame')
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=0)
+        main_frame.rowconfigure(1, weight=1)
 
-        left_frame = ttk.Frame(main_frame)
-        left_frame.grid(row=0, column=0, padx=10)
-
-        board_container = ttk.Frame(left_frame, relief=tk.SUNKEN, borderwidth=2)
-        board_container.grid(row=0, column=0, pady=10)
-        self.board_label = ttk.Label(board_container)
+        header_frame = ttk.Frame(main_frame, padding=(16, 12), style='Header.TFrame')
+        header_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 12))
+        header_frame.columnconfigure(0, weight=1)
+        ttk.Label(header_frame, text="Chess AI Self-Play Lab", style='Header.TLabel').grid(row=0, column=0, sticky=tk.W)
+        self.summary_var = tk.StringVar(value="Ready")
+        ttk.Label(header_frame, textvariable=self.summary_var, style='HeaderMeta.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(3, 0))
+        self.device_var = tk.StringVar(value=f"{self.ai.device} | AMP {'ON' if self.ai.use_amp else 'OFF'}")
+        ttk.Label(header_frame, textvariable=self.device_var, style='HeaderMeta.TLabel').grid(row=0, column=1, rowspan=2, sticky=tk.E)
+        
+        left_frame = ttk.Frame(main_frame, style='App.TFrame')
+        left_frame.grid(row=1, column=0, sticky=(tk.N, tk.S, tk.W), padx=(0, 14))
+        
+        board_container = tk.Frame(left_frame, bg=self.colors['board_edge'], padx=10, pady=10)
+        board_container.grid(row=0, column=0, sticky=tk.N, pady=(0, 12))
+        
+        self.board_label = tk.Label(board_container, bg=self.colors['board_edge'], bd=0, cursor='hand2')
         self.board_label.grid(row=0, column=0)
         self.board_label.bind("<Button-1>", self.on_board_click)
+        
+        history_frame = ttk.LabelFrame(left_frame, text="Move History", padding=10, style='Card.TLabelframe')
+        history_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        history_frame.columnconfigure(0, weight=1)
+        
+        self.history_text = scrolledtext.ScrolledText(
+            history_frame, height=8, width=54, wrap=tk.WORD, relief=tk.FLAT,
+            bg=self.colors['text_bg'], fg=self.colors['text'], insertbackground=self.colors['text'],
+            padx=10, pady=8
+        )
+        self.history_text.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        ttk.Button(history_frame, text="Copy Moves", command=self.copy_moves).grid(row=1, column=0, sticky=tk.E, pady=(8, 0))
+        
+        right_frame = ttk.Frame(main_frame, style='App.TFrame')
+        right_frame.grid(row=1, column=1, sticky=(tk.N, tk.S, tk.W, tk.E))
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(0, weight=1)
+        
+        notebook = ttk.Notebook(right_frame)
+        notebook.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
 
-        history_frame = ttk.LabelFrame(left_frame, text="Move History", padding="5")
-        history_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=10)
-        self.history_text = scrolledtext.ScrolledText(history_frame, height=8, width=40, wrap=tk.WORD)
-        self.history_text.grid(row=0, column=0)
-        ttk.Button(history_frame, text="Copy Moves", command=self.copy_moves, width=15).grid(row=1, column=0, pady=2)
+        train_tab = ttk.Frame(notebook, padding=10, style='Panel.TFrame')
+        play_tab = ttk.Frame(notebook, padding=10, style='Panel.TFrame')
+        stats_tab = ttk.Frame(notebook, padding=10, style='Panel.TFrame')
+        notebook.add(train_tab, text="Training")
+        notebook.add(play_tab, text="Play")
+        notebook.add(stats_tab, text="Stats")
 
-        right_frame = ttk.Frame(main_frame)
-        right_frame.grid(row=0, column=1, sticky=(tk.N, tk.W, tk.E), padx=10)
+        train_frame = ttk.LabelFrame(train_tab, text="Self-Play Parameters", padding=12, style='Card.TLabelframe')
+        train_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        train_frame.columnconfigure(1, weight=1)
 
-        # Training controls
-        train_frame = ttk.LabelFrame(right_frame, text="Training Controls", padding="10")
-        train_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
-
-        ttk.Label(train_frame, text="Number of games:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        def add_entry(row, label, variable, hint=None):
+            ttk.Label(train_frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=6, padx=(0, 10))
+            entry = ttk.Entry(train_frame, textvariable=variable, width=16)
+            entry.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=6)
+            if hint:
+                ttk.Label(train_frame, text=hint, style='Muted.TLabel').grid(row=row, column=2, sticky=tk.W, padx=(10, 0))
+            return entry
+        
         self.num_games_var = tk.StringVar(value="10")
-        ttk.Entry(train_frame, textvariable=self.num_games_var, width=15).grid(row=0, column=1, pady=5, padx=5)
-
-        ttk.Label(train_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.temperature_var = tk.StringVar(value="1.0")
-        ttk.Entry(train_frame, textvariable=self.temperature_var, width=15).grid(row=1, column=1, pady=5, padx=5)
-
-        ttk.Label(train_frame, text="Temp threshold:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.temp_threshold_var = tk.StringVar(value="30")
-        ttk.Entry(train_frame, textvariable=self.temp_threshold_var, width=15).grid(row=2, column=1, pady=5, padx=5)
-        ttk.Label(train_frame, text="(explore N moves then greedy)",
-                  font=('Arial', 8), foreground='gray').grid(row=2, column=2, sticky=tk.W, padx=5)
+        self.mcts_sims_var = tk.StringVar(value=str(self.ai.mcts_simulations))
+        self.mcts_batch_var = tk.StringVar(value=str(self.ai.mcts_batch_size))
+        self.train_steps_var = tk.StringVar(value=str(self.ai.train_steps_per_game))
+        self.draw_penalty_var = tk.StringVar(value=str(self.ai.draw_penalty))
+        self.repeat_penalty_var = tk.StringVar(value=str(self.ai.repetition_penalty))
+        self.rep_draw_penalty_var = tk.StringVar(value=str(self.ai.repetition_draw_penalty))
+        self.stockfish_path_var = tk.StringVar(value=self.ai.stockfish_path or "")
+        self.stockfish_start_var = tk.StringVar(value=str(self.ai.stockfish_teacher_start))
+        self.stockfish_end_var = tk.StringVar(value=str(self.ai.stockfish_teacher_end))
+        self.stockfish_decay_var = tk.StringVar(value=str(self.ai.stockfish_teacher_decay_games))
 
-        bf = ttk.Frame(train_frame)
-        bf.grid(row=3, column=0, columnspan=3, pady=10)
-        self.train_button = ttk.Button(bf, text="Start Training", command=self.start_training)
-        self.train_button.grid(row=0, column=0, padx=5)
-        self.stop_button = ttk.Button(bf, text="Stop Training", command=self.stop_training, state=tk.DISABLED)
-        self.stop_button.grid(row=0, column=1, padx=5)
+        add_entry(0, "Games", self.num_games_var)
+        add_entry(1, "Temperature", self.temperature_var)
+        add_entry(2, "Explore moves", self.temp_threshold_var, "then greedy")
+        add_entry(3, "MCTS simulations", self.mcts_sims_var)
+        add_entry(4, "MCTS batch", self.mcts_batch_var)
+        add_entry(5, "Train steps/game", self.train_steps_var)
+        add_entry(6, "Draw penalty", self.draw_penalty_var)
+        add_entry(7, "Repeat penalty", self.repeat_penalty_var)
+        add_entry(8, "Repeat draw penalty", self.rep_draw_penalty_var)
+        add_entry(9, "Stockfish path", self.stockfish_path_var, "optional")
+        add_entry(10, "Teacher start", self.stockfish_start_var)
+        add_entry(11, "Teacher end", self.stockfish_end_var)
+        add_entry(12, "Teacher decay games", self.stockfish_decay_var)
+        
+        button_frame = ttk.Frame(train_frame)
+        button_frame.grid(row=13, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(12, 4))
+        for col in range(3):
+            button_frame.columnconfigure(col, weight=1)
+        
+        self.train_button = ttk.Button(button_frame, text="Start Training", command=self.start_training, style='Accent.TButton')
+        self.train_button.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 6))
+        
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_training, state=tk.DISABLED, style='Danger.TButton')
+        self.stop_button.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=6)
 
+        self.reset_model_button = ttk.Button(button_frame, text="Fresh Start", command=self.reset_model)
+        self.reset_model_button.grid(row=0, column=2, sticky=(tk.W, tk.E), padx=(6, 0))
+        
+        progress_frame = ttk.LabelFrame(train_tab, text="Training Status", padding=12, style='Card.TLabelframe')
+        progress_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(12, 0))
         self.progress_var = tk.StringVar(value="No training in progress")
-        ttk.Label(train_frame, textvariable=self.progress_var, wraplength=250).grid(
-            row=4, column=0, columnspan=3, pady=5)
+        ttk.Label(progress_frame, textvariable=self.progress_var, wraplength=360, style='Value.TLabel').grid(row=0, column=0, sticky=tk.W)
+        
+        play_frame = ttk.LabelFrame(play_tab, text="Game Controls", padding=12, style='Card.TLabelframe')
+        play_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        for col in range(2):
+            play_frame.columnconfigure(col, weight=1)
+        
+        ttk.Button(play_frame, text="Play White", command=lambda: self.start_game(chess.WHITE), style='Accent.TButton').grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5, padx=(0, 5))
+        ttk.Button(play_frame, text="Play Black", command=lambda: self.start_game(chess.BLACK), style='Accent.TButton').grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        ttk.Button(play_frame, text="Player vs Player", command=self.start_player_vs_player).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        ttk.Button(play_frame, text="AI vs AI Demo", command=self.watch_ai_game).grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.pause_button = ttk.Button(play_frame, text="Pause", command=self.toggle_pause_ai_game, state=tk.DISABLED)
+        self.pause_button.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5, padx=(0, 5))
+        ttk.Button(play_frame, text="New Game", command=self.reset_game).grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var, command=self.on_flip_toggle).grid(row=4, column=0, sticky=tk.W, pady=(12, 4))
+        ttk.Checkbutton(play_frame, text="Learn from my games", variable=self.learn_from_human_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=4)
+        
+        stats_frame = ttk.LabelFrame(stats_tab, text="Training Statistics", padding=12, style='Card.TLabelframe')
+        stats_frame.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
+        stats_tab.rowconfigure(0, weight=1)
+        stats_tab.columnconfigure(0, weight=1)
+        stats_frame.rowconfigure(0, weight=1)
+        stats_frame.columnconfigure(0, weight=1)
+        
+        self.stats_text = tk.Text(
+            stats_frame, height=29, width=42, wrap=tk.WORD, relief=tk.FLAT,
+            bg=self.colors['text_bg'], fg=self.colors['text'], insertbackground=self.colors['text'],
+            padx=10, pady=8
+        )
+        self.stats_text.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
+        ttk.Button(stats_frame, text="Copy Stats", command=self.copy_stats).grid(row=1, column=0, sticky=tk.E, pady=(8, 0))
 
-        # Play controls
-        play_frame = ttk.LabelFrame(right_frame, text="Play Controls", padding="10")
-        play_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
-
-        ttk.Button(play_frame, text="Play as White",  command=lambda: self.start_game(chess.WHITE), width=20).grid(row=0, column=0, pady=5)
-        ttk.Button(play_frame, text="Play as Black",  command=lambda: self.start_game(chess.BLACK), width=20).grid(row=1, column=0, pady=5)
-        ttk.Button(play_frame, text="AI vs AI Demo",  command=self.watch_ai_game, width=20).grid(row=2, column=0, pady=5)
-        self.pause_button = ttk.Button(play_frame, text="Pause", command=self.toggle_pause_ai_game, width=20, state=tk.DISABLED)
-        self.pause_button.grid(row=3, column=0, pady=5)
-        ttk.Button(play_frame, text="New Game", command=self.reset_game, width=20).grid(row=4, column=0, pady=5)
-        ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var, command=self.on_flip_toggle).grid(row=5, column=0, pady=5)
-
-        # Stats
-        stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding="10")
-        stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
-        self.stats_text = tk.Text(stats_frame, height=20, width=35, wrap=tk.WORD)
-        self.stats_text.grid(row=0, column=0)
-        ttk.Button(stats_frame, text="Copy Stats", command=self.copy_stats, width=15).grid(row=1, column=0, pady=2)
-
-        amp_status = "AMP: ON" if self.ai.use_amp else "AMP: OFF"
-        param_count = sum(p.numel() for p in self.ai.model.parameters()) / 1e6
-        ttk.Label(stats_frame, text=f"Device: {self.ai.device}",        foreground="blue").grid(row=2, column=0, pady=1)
-        ttk.Label(stats_frame, text=amp_status,                          foreground="green").grid(row=3, column=0, pady=1)
-        ttk.Label(stats_frame, text=f"Model: {param_count:.1f}M params", foreground="purple").grid(row=4, column=0, pady=1)
-        ttk.Label(stats_frame, text="✅ SE-ResNet  |  AlphaZero Loss  |  Tree Reuse",
-                  foreground="red", font=('Arial', 9, 'bold')).grid(row=5, column=0, pady=1)
-
+        badge_frame = ttk.Frame(stats_tab, padding=(0, 10, 0, 0), style='Panel.TFrame')
+        badge_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        ttk.Label(badge_frame, text="Teacher + repetition-aware search active", style='Value.TLabel').grid(row=0, column=0, sticky=tk.W)
+        
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).grid(
-            row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
-
+        ttk.Label(main_frame, textvariable=self.status_var, style='Status.TLabel', anchor=tk.W).grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(12, 0))
+        
         self.update_board_display()
         self.update_stats_display()
-
+        self.update_summary_display()
+    
     def on_flip_toggle(self):
         self.flip_board = bool(self.flip_var.get())
         self.update_board_display()
-
-    def board_to_image(self):
+    
+    def legacy_board_to_image(self):
         board_size = self.square_size * 8
         image = Image.new('RGB', (board_size + 40, board_size + 40), 'white')
-        draw  = ImageDraw.Draw(image)
-
-        light_sq     = (240, 217, 181)
-        dark_sq      = (181, 136,  99)
-        selected_col = (255, 255, 100)
-        legal_col    = (144, 238, 144)
-
+        draw = ImageDraw.Draw(image)
+        
+        light_square = (240, 217, 181)
+        dark_square = (181, 136, 99)
+        selected_color = (255, 255, 100)
+        legal_move_color = (144, 238, 144)
+        
         try:
             piece_font = ImageFont.truetype("seguisym.ttf", int(self.square_size * 0.7))
             coord_font = ImageFont.truetype("arial.ttf", 12)
-        except Exception:
+        except:
             try:
                 piece_font = ImageFont.truetype("Arial.ttf", int(self.square_size * 0.7))
-                coord_font = piece_font
-            except Exception:
-                piece_font = coord_font = ImageFont.load_default()
-
-        off = 20
-        legal_targets = {m.to_square for m in self.legal_moves_for_selected}
-
+                coord_font = ImageFont.truetype("Arial.ttf", 12)
+            except:
+                piece_font = ImageFont.load_default()
+                coord_font = ImageFont.load_default()
+        
+        offset = 32
+        
         for rank in range(8):
             for file in range(8):
-                x1 = (file if not self.flip_board else 7 - file) * self.square_size + off
-                y1 = ((7 - rank) if not self.flip_board else rank) * self.square_size + off
-                x2, y2 = x1 + self.square_size, y1 + self.square_size
-                sq = chess.square(file, rank)
-                if sq == self.selected_square:
-                    color = selected_col
-                elif sq in legal_targets:
-                    color = legal_col
-                elif (rank + file) % 2 == 0:
-                    color = light_sq
+                if not self.flip_board:
+                    x1 = file * self.square_size + offset
+                    y1 = (7 - rank) * self.square_size + offset
                 else:
-                    color = dark_sq
+                    x1 = (7 - file) * self.square_size + offset
+                    y1 = rank * self.square_size + offset
+                x2 = x1 + self.square_size
+                y2 = y1 + self.square_size
+                square = chess.square(file, rank)
+                if square == self.selected_square:
+                    color = selected_color
+                elif square in [move.to_square for move in self.legal_moves_for_selected]:
+                    color = legal_move_color
+                elif (rank + file) % 2 == 0:
+                    color = light_square
+                else:
+                    color = dark_square
                 draw.rectangle([x1, y1, x2, y2], fill=color, outline='gray')
-
-        files = ['a','b','c','d','e','f','g','h']
-        ranks = ['1','2','3','4','5','6','7','8']
+        
+        files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        ranks = ['1', '2', '3', '4', '5', '6', '7', '8']
         if self.flip_board:
-            files, ranks = list(reversed(files)), list(reversed(ranks))
-
-        for i, ch in enumerate(files):
-            x = i * self.square_size + self.square_size // 2 + off
-            draw.text((x, 5),                   ch, fill='black', font=coord_font, anchor='mm')
-            draw.text((x, board_size + off + 15), ch, fill='black', font=coord_font, anchor='mm')
-        for i, ch in enumerate(ranks):
-            y = ((7 - i) if not self.flip_board else i) * self.square_size + self.square_size // 2 + off
-            draw.text((5,                   y), ch, fill='black', font=coord_font, anchor='mm')
-            draw.text((board_size + off + 15, y), ch, fill='black', font=coord_font, anchor='mm')
-
-        symbols = {'P':'♙','N':'♘','B':'♗','R':'♖','Q':'♕','K':'♔',
-                   'p':'♟','n':'♞','b':'♝','r':'♜','q':'♛','k':'♚'}
+            files = list(reversed(files))
+            ranks = list(reversed(ranks))
+        
+        for i, file_char in enumerate(files):
+            x = i * self.square_size + self.square_size // 2 + offset
+            draw.text((x, 5), file_char, fill='black', font=coord_font, anchor='mm')
+            draw.text((x, board_size + offset + 15), file_char, fill='black', font=coord_font, anchor='mm')
+        
+        for i, rank_char in enumerate(ranks):
+            if not self.flip_board:
+                y = (7 - i) * self.square_size + self.square_size // 2 + offset
+            else:
+                y = i * self.square_size + self.square_size // 2 + offset
+            draw.text((5, y), rank_char, fill='black', font=coord_font, anchor='mm')
+            draw.text((board_size + offset + 15, y), rank_char, fill='black', font=coord_font, anchor='mm')
+        
+        piece_symbols = {
+            'P': '♙', 'N': '♘', 'B': '♗', 'R': '♖', 'Q': '♕', 'K': '♔',
+            'p': '♟', 'n': '♞', 'b': '♝', 'r': '♜', 'q': '♛', 'k': '♚'
+        }
+        
         for rank in range(8):
             for file in range(8):
-                sq = chess.square(file, rank)
-                p  = self.board.piece_at(sq)
-                if not p:
-                    continue
-                ch = symbols.get(p.symbol(), p.symbol())
-                x = (file if not self.flip_board else 7 - file) * self.square_size + self.square_size // 2 + off
-                y = ((7 - rank) if not self.flip_board else rank) * self.square_size + self.square_size // 2 + off
-                pc = 'white' if p.color == chess.WHITE else 'black'
-                oc = 'black' if p.color == chess.WHITE else 'white'
-                for dx, dy in [(-1,-1),(-1,1),(1,-1),(1,1)]:
-                    draw.text((x+dx, y+dy), ch, fill=oc, font=piece_font, anchor='mm')
-                draw.text((x, y), ch, fill=pc, font=piece_font, anchor='mm')
+                square = chess.square(file, rank)
+                piece = self.board.piece_at(square)
+                if piece:
+                    symbol = piece.symbol()
+                    piece_char = piece_symbols.get(symbol, symbol)
+                    if not self.flip_board:
+                        x = file * self.square_size + self.square_size // 2 + offset
+                        y = (7 - rank) * self.square_size + self.square_size // 2 + offset
+                    else:
+                        x = (7 - file) * self.square_size + self.square_size // 2 + offset
+                        y = rank * self.square_size + self.square_size // 2 + offset
+                    piece_color = 'white' if piece.color == chess.WHITE else 'black'
+                    outline_color = 'black' if piece.color == chess.WHITE else 'white'
+                    for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                        draw.text((x + dx, y + dy), piece_char, fill=outline_color, font=piece_font, anchor='mm')
+                    draw.text((x, y), piece_char, fill=piece_color, font=piece_font, anchor='mm')
+        
+        return ImageTk.PhotoImage(image)
+    
+    def board_to_image(self):
+        board_size = self.square_size * 8
+        offset = 32
+        margin = offset * 2
+        image = Image.new('RGB', (board_size + margin, board_size + margin), self.colors['app_bg'])
+        draw = ImageDraw.Draw(image)
+
+        try:
+            piece_font = ImageFont.truetype("seguisym.ttf", int(self.square_size * 0.7))
+            coord_font = ImageFont.truetype("arial.ttf", 13)
+        except:
+            try:
+                piece_font = ImageFont.truetype("Arial.ttf", int(self.square_size * 0.7))
+                coord_font = ImageFont.truetype("Arial.ttf", 13)
+            except:
+                piece_font = ImageFont.load_default()
+                coord_font = ImageFont.load_default()
+
+        draw.rounded_rectangle(
+            [offset - 6, offset - 6, offset + board_size + 6, offset + board_size + 6],
+            radius=12,
+            fill=self.colors['board_edge']
+        )
+
+        legal_targets = {move.to_square for move in self.legal_moves_for_selected}
+        last_move_squares = set()
+        if self.last_move:
+            last_move_squares = {self.last_move.from_square, self.last_move.to_square}
+        check_square = self.board.king(self.board.turn) if self.board.is_check() else None
+
+        for rank in range(8):
+            for file in range(8):
+                if not self.flip_board:
+                    x1 = file * self.square_size + offset
+                    y1 = (7 - rank) * self.square_size + offset
+                else:
+                    x1 = (7 - file) * self.square_size + offset
+                    y1 = rank * self.square_size + offset
+                x2 = x1 + self.square_size
+                y2 = y1 + self.square_size
+                square = chess.square(file, rank)
+
+                if square == self.selected_square:
+                    color = self.colors['selected_square']
+                elif square == check_square:
+                    color = self.colors['check']
+                elif square in last_move_squares:
+                    color = self.colors['last_move']
+                elif (rank + file) % 2 == 0:
+                    color = self.colors['light_square']
+                else:
+                    color = self.colors['dark_square']
+
+                draw.rectangle([x1, y1, x2, y2], fill=color)
+                if square in legal_targets:
+                    center = (x1 + self.square_size // 2, y1 + self.square_size // 2)
+                    if self.board.piece_at(square):
+                        inset = 8
+                        draw.ellipse(
+                            [x1 + inset, y1 + inset, x2 - inset, y2 - inset],
+                            outline=self.colors['legal_move'],
+                            width=4
+                        )
+                    else:
+                        radius = max(5, self.square_size // 8)
+                        draw.ellipse(
+                            [center[0] - radius, center[1] - radius, center[0] + radius, center[1] + radius],
+                            fill=self.colors['legal_move']
+                        )
+
+        files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        ranks = ['1', '2', '3', '4', '5', '6', '7', '8']
+        if self.flip_board:
+            files = list(reversed(files))
+            ranks = list(reversed(ranks))
+
+        for i, file_char in enumerate(files):
+            x = i * self.square_size + self.square_size // 2 + offset
+            draw.text((x, 14), file_char, fill=self.colors['muted'], font=coord_font, anchor='mm')
+            draw.text((x, board_size + offset + 18), file_char, fill=self.colors['muted'], font=coord_font, anchor='mm')
+
+        for i, rank_char in enumerate(ranks):
+            y = ((7 - i) if not self.flip_board else i) * self.square_size + self.square_size // 2 + offset
+            draw.text((14, y), rank_char, fill=self.colors['muted'], font=coord_font, anchor='mm')
+            draw.text((board_size + offset + 18, y), rank_char, fill=self.colors['muted'], font=coord_font, anchor='mm')
+
+        piece_symbols = {
+            'P': '\u2659', 'N': '\u2658', 'B': '\u2657', 'R': '\u2656', 'Q': '\u2655', 'K': '\u2654',
+            'p': '\u265f', 'n': '\u265e', 'b': '\u265d', 'r': '\u265c', 'q': '\u265b', 'k': '\u265a'
+        }
+
+        for rank in range(8):
+            for file in range(8):
+                square = chess.square(file, rank)
+                piece = self.board.piece_at(square)
+                if piece:
+                    piece_char = piece_symbols.get(piece.symbol(), piece.symbol())
+                    if not self.flip_board:
+                        x = file * self.square_size + self.square_size // 2 + offset
+                        y = (7 - rank) * self.square_size + self.square_size // 2 + offset
+                    else:
+                        x = (7 - file) * self.square_size + self.square_size // 2 + offset
+                        y = rank * self.square_size + self.square_size // 2 + offset
+
+                    piece_color = '#f8f4e8' if piece.color == chess.WHITE else '#1f2420'
+                    outline_color = '#20251f' if piece.color == chess.WHITE else '#f8f4e8'
+                    for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                        draw.text((x + dx, y + dy), piece_char, fill=outline_color, font=piece_font, anchor='mm')
+                    draw.text((x, y), piece_char, fill=piece_color, font=piece_font, anchor='mm')
 
         return ImageTk.PhotoImage(image)
 
@@ -1134,85 +2096,260 @@ class ChessGUI:
             self.board_label.image = photo
         except Exception as e:
             self.board_label.config(text=str(self.board))
+        self.update_summary_display()
 
+    def current_mode_text(self):
+        if self.is_training:
+            return "Training"
+        if self.ai_vs_ai_running:
+            return "AI vs AI paused" if self.ai_vs_ai_paused else "AI vs AI"
+        if self.player_vs_player_mode:
+            return "Player vs Player"
+        if self.human_color == chess.WHITE:
+            return "Playing White"
+        if self.human_color == chess.BLACK:
+            return "Playing Black"
+        return "Ready"
+
+    def update_summary_display(self):
+        if not hasattr(self, 'summary_var'):
+            return
+        turn = "White" if self.board.turn == chess.WHITE else "Black"
+        status = "check" if self.board.is_check() else "to move"
+        stats = self.ai.training_stats
+        self.summary_var.set(
+            f"{self.current_mode_text()} | {turn} {status} | "
+            f"{len(self.move_history)} plies | {stats.get('games_played', 0)} trained games | "
+            f"{stats.get('draws', 0)} draws"
+        )
+    
     def update_stats_display(self):
-        s = self.ai.training_stats
-        gp = max(s['games_played'], 1)
-        ww = s['white_wins'] / gp * 100
-        bw = s['black_wins'] / gp * 100
-        dr = s['draws']      / gp * 100
-        pt = max(s['positions_total'], 1)
-        fr = s['positions_flipped'] / pt * 100
-        lr = self.ai.optimizer.param_groups[0]['lr']
-        hits   = s.get('tree_reuse_hits', 0)
-        misses = s.get('tree_reuse_misses', 0)
-        total_searches = max(hits + misses, 1)
-        hit_rate = hits / total_searches * 100
+        stats = self.ai.training_stats
+        win_rate_white = (stats['white_wins'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
+        win_rate_black = (stats['black_wins'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
+        draw_rate = (stats['draws'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
+        flip_rate = (stats['positions_flipped'] / stats['positions_total'] * 100) if stats['positions_total'] > 0 else 0
+        current_lr = self.ai.optimizer.param_groups[0]['lr']
+        rep_penalties = stats.get('repetition_penalties_applied', 0)
+        avg_game_time = (stats.get('total_game_time', 0.0) / stats['games_played']) if stats['games_played'] > 0 else 0.0
+        avg_train_time = (stats.get('total_train_time', 0.0) / stats['games_played']) if stats['games_played'] > 0 else 0.0
+        avg_moves = (stats['total_moves'] / stats['games_played']) if stats['games_played'] > 0 else 0.0
+        last_moves = stats.get('last_game_moves', 0)
+        last_game_time = stats.get('last_game_time', 0.0)
+        seconds_per_move = (last_game_time / last_moves) if last_moves > 0 else 0.0
+        stockfish_status = "available" if self.ai.stockfish_available() else "off"
+        if self.ai.stockfish_disabled_reason:
+            stockfish_status = "disabled"
+        
+        stats_text = f"""Games: {stats['games_played']}
+Moves: {stats['total_moves']}
+Steps: {stats.get('total_training_steps', 0)}
 
-        txt = (f"Games:  {s['games_played']}\n"
-               f"Moves:  {s['total_moves']}\n"
-               f"Steps:  {s['total_training_steps']}\n\n"
-               f"White:  {s['white_wins']} ({ww:.1f}%)\n"
-               f"Black:  {s['black_wins']} ({bw:.1f}%)\n"
-               f"Draws:  {s['draws']} ({dr:.1f}%)\n\n"
-               f"Buffer: {len(self.ai.replay_buffer)}\n"
-               f"Augm:   {fr:.1f}% flipped\n"
-               f"RepPen: {s['repetition_penalties_applied']}\n"
-               f"LR:     {lr:.2e}\n\n"
-               f"── Tree Reuse ──\n"
-               f"Hits:   {hits} ({hit_rate:.1f}%)\n"
-               f"Misses: {misses}\n\n"
-               f"DrawP:  {self.ai.draw_penalty}\n"
-               f"RepP:   {self.ai.repetition_penalty}\n"
-               f"Dir:    {self.ai.save_dir}")
+White: {stats['white_wins']} ({win_rate_white:.1f}%)
+Black: {stats['black_wins']} ({win_rate_black:.1f}%)
+Draws: {stats['draws']} ({draw_rate:.1f}%)
+
+Buffer: {len(self.ai.replay_buffer)}
+Augmentation: {flip_rate:.1f}% flipped
+Rep.penalties: {rep_penalties}
+Human games: {stats.get('human_games', 0)}
+Human positions: {stats.get('human_positions', 0)}
+Human train steps: {stats.get('human_train_steps', 0)}
+Stockfish games: {stats.get('stockfish_games', 0)}
+Stockfish positions: {stats.get('stockfish_positions', 0)}
+Stockfish skipped: {stats.get('stockfish_unavailable_games', 0)}
+Last game: {last_moves} moves, {last_game_time:.1f}s
+Avg game: {avg_game_time:.1f}s, {avg_moves:.1f} moves
+Avg train: {avg_train_time:.2f}s
+Sec/move: {seconds_per_move:.2f}
+Rule draws: {stats.get('rule_draws', 0)}
+Max-move draws: {stats.get('max_move_draws', 0)}
+Last draw: {stats.get('last_draw_reason', '')}
+LR: {current_lr:.2e}
+MCTS sims: {self.ai.mcts_simulations}
+MCTS batch: {self.ai.mcts_batch_size}
+Steps/game: {self.ai.train_steps_per_game}
+Draw penalty: {self.ai.draw_penalty}
+Rep penalty: {self.ai.repetition_penalty}
+Rep draw penalty: {self.ai.repetition_draw_penalty}
+Teacher rate: {self.ai.stockfish_teacher_rate():.2f}
+Stockfish: {stockfish_status}
+Model: {self.ai.save_dir}""".strip()
+        
         self.stats_text.delete(1.0, tk.END)
-        self.stats_text.insert(1.0, txt)
-
+        self.stats_text.insert(1.0, stats_text)
+        self.update_summary_display()
+    
     def update_move_history(self):
         self.history_text.delete(1.0, tk.END)
         if not self.move_history:
             self.history_text.insert(1.0, "No moves yet")
             return
-        text = ""
-        for i, m in enumerate(self.move_history):
-            text += (f"{i//2+1}. {m} " if i % 2 == 0 else f"{m}\n")
-        self.history_text.insert(1.0, text)
+        move_text = ""
+        for i, move in enumerate(self.move_history):
+            if i % 2 == 0:
+                move_text += f"{i//2 + 1}. {move} "
+            else:
+                move_text += f"{move}\n"
+        self.history_text.insert(1.0, move_text)
         self.history_text.see(tk.END)
 
-    def on_board_click(self, event):
-        if (self.human_color is None or self.board.turn != self.human_color
-                or self.board.is_game_over() or self.ai_thinking):
+    def reset_human_learning_game(self):
+        self.human_game_data = []
+        self.human_position_counts = self.ai.new_repetition_tracker()
+        self.human_game_start_time = time.time()
+
+    def human_move_policy_target(self, move):
+        flip = (self.board.turn == chess.BLACK)
+        move_idx = self.ai.move_to_index(move, flip=flip)
+        if 0 <= move_idx < 4096:
+            return ((move_idx, 1.0),)
+        return ()
+
+    def active_human_color(self):
+        if self.player_vs_player_mode:
+            return self.board.turn
+        return self.human_color
+
+    def record_human_learning_position(self, policy_target, move=None, verify_human=False):
+        if not self.learn_from_human_var.get():
             return
-        off = 20
-        x, y = event.x - off, event.y - off
-        if not (0 <= x < self.square_size*8 and 0 <= y < self.square_size*8):
+        if self.human_color is None and not self.player_vs_player_mode:
+            return
+        if not policy_target:
+            return
+
+        policy_weight = 1.0
+        if verify_human and move is not None:
+            policy_target, policy_weight = self.ai.verified_human_policy_target(
+                self.board,
+                move,
+                policy_target
+            )
+
+        visit_count = self.ai.repetition_count_for_board(self.board, self.human_position_counts)
+        self.ai.record_position_visit(self.board, self.human_position_counts)
+        if visit_count > 0:
+            self.ai.training_stats['repetition_penalties_applied'] += 1
+        destination_penalty = self.ai.move_into_repetition_penalty(
+            self.board,
+            move,
+            self.human_position_counts
+        )
+        if destination_penalty < 0.0:
+            self.ai.training_stats['repetition_penalties_applied'] += 1
+
+        can_flip = self.ai.is_position_symmetric_safe(self.board)
+        board_tensor = self.ai.board_to_tensor(self.board).cpu()
+        legal_indices = self.ai.legal_policy_indices(self.board)
+        player = self.board.turn
+        self.human_game_data.append((
+            board_tensor,
+            policy_target,
+            legal_indices,
+            player,
+            can_flip,
+            0.0,
+            None,
+            policy_weight
+        ))
+
+    def finish_human_learning_game(self):
+        if not self.learn_from_human_var.get() or not self.human_game_data:
+            return ""
+
+        outcome = self.board.outcome(claim_draw=True)
+        if outcome and outcome.winner == chess.WHITE:
+            reward = 1.0
+            self.ai.training_stats['white_wins'] += 1
+        elif outcome and outcome.winner == chess.BLACK:
+            reward = -1.0
+            self.ai.training_stats['black_wins'] += 1
+        else:
+            reward = self.ai.draw_value_for_board(self.board)
+            self.ai.training_stats['draws'] += 1
+            self.ai.training_stats['rule_draws'] += 1
+            self.ai.training_stats['last_draw_reason'] = (
+                outcome.termination.name.lower()
+                if outcome else 'unknown'
+            )
+
+        game_time = time.time() - self.human_game_start_time if self.human_game_start_time else 0.0
+        positions = len(self.human_game_data)
+
+        self.ai.add_game_to_buffer(self.human_game_data, reward)
+        self.ai.clean_old_data()
+        p_loss, v_loss, steps_done, train_time = self.ai.train_from_replay(
+            steps=self.ai.train_steps_per_game,
+            require_min_buffer=False
+        )
+
+        stats = self.ai.training_stats
+        stats['games_played'] += 1
+        stats['total_moves'] += positions
+        stats['last_game_moves'] = positions
+        stats['total_game_time'] += game_time
+        stats['total_train_time'] += train_time
+        stats['last_game_time'] = game_time
+        stats['last_train_time'] = train_time
+        stats['human_games'] = stats.get('human_games', 0) + 1
+        stats['human_positions'] = stats.get('human_positions', 0) + positions
+        stats['human_train_steps'] = stats.get('human_train_steps', 0) + steps_done
+
+        self.human_game_data = []
+        self.human_position_counts = self.ai.new_repetition_tracker()
+        self.human_game_start_time = None
+        self.ai.save_model()
+        self.update_stats_display()
+
+        if steps_done > 0:
+            return f"\nLearned from {positions} positions. P: {p_loss:.3f} V: {v_loss:.3f}"
+        return f"\nSaved {positions} positions to replay."
+    
+    def on_board_click(self, event):
+        active_color = self.active_human_color()
+        if active_color is None or self.board.turn != active_color or self.ai.is_terminal_for_training(self.board) or self.ai_thinking:
+            return
+        offset = 32
+        x, y = event.x - offset, event.y - offset
+        if x < 0 or y < 0 or x >= self.square_size * 8 or y >= self.square_size * 8:
             return
         col = int(min(7, max(0, x // self.square_size)))
         row = int(min(7, max(0, y // self.square_size)))
-        file, rank = ((col, 7-row) if not self.flip_board else (7-col, row))
-        sq = chess.square(file, rank)
-
+        if not self.flip_board:
+            file, rank = col, 7 - row
+        else:
+            file, rank = 7 - col, row
+        square = chess.square(file, rank)
         if self.selected_square is None:
-            p = self.board.piece_at(sq)
-            if p and p.color == self.human_color:
-                self.selected_square = sq
-                self.legal_moves_for_selected = [m for m in self.board.legal_moves if m.from_square == sq]
-                self.status_var.set(f"Selected {chess.SQUARE_NAMES[sq]}")
+            piece = self.board.piece_at(square)
+            if piece and piece.color == active_color:
+                self.selected_square = square
+                self.legal_moves_for_selected = [m for m in self.board.legal_moves if m.from_square == square]
+                self.status_var.set(f"Selected {chess.SQUARE_NAMES[square]}")
                 self.update_board_display()
         else:
-            p = self.board.piece_at(self.selected_square)
-            promo = None
-            if p and p.piece_type == chess.PAWN and rank in (0, 7):
+            piece = self.board.piece_at(self.selected_square)
+            if piece and piece.piece_type == chess.PAWN and (rank == 0 or rank == 7):
                 promo = self.ask_promotion_piece() or chess.QUEEN
-            move = chess.Move(self.selected_square, sq, promotion=promo)
+                move = chess.Move(self.selected_square, square, promotion=promo)
+            else:
+                move = chess.Move(self.selected_square, square)
             if move in self.board.legal_moves:
-                self._last_human_move = move
+                self.record_human_learning_position(
+                    self.human_move_policy_target(move),
+                    move,
+                    verify_human=True
+                )
                 self.make_move(move)
                 self.selected_square = None
                 self.legal_moves_for_selected = []
                 self.update_board_display()
-                if self.board.is_game_over():
+                if self.ai.is_terminal_for_training(self.board):
                     self.game_over()
+                elif self.player_vs_player_mode:
+                    next_player = "White" if self.board.turn == chess.WHITE else "Black"
+                    self.status_var.set(f"{next_player} to move")
                 else:
                     self.window.after(300, self.ai_move)
             else:
@@ -1220,96 +2357,154 @@ class ChessGUI:
                 self.legal_moves_for_selected = []
                 self.status_var.set("Illegal move")
                 self.update_board_display()
-
-    def ask_promotion_piece(self):
+    
+    def legacy_ask_promotion_piece(self):
         dlg = tk.Toplevel(self.window)
         dlg.title("Promotion")
         dlg.transient(self.window)
         dlg.grab_set()
         choice = {'piece': None}
         ttk.Label(dlg, text="Promote to:", padding=10).grid(row=0, column=0, columnspan=4)
-        for col, (sym, pc) in enumerate([('♕', chess.QUEEN), ('♖', chess.ROOK),
-                                          ('♗', chess.BISHOP), ('♘', chess.KNIGHT)]):
-            ttk.Button(dlg, text=sym, width=8,
-                       command=lambda p=pc: [choice.update({'piece': p}), dlg.destroy()]).grid(
-                row=1, column=col, padx=5, pady=5)
+        ttk.Button(dlg, text="♕", width=8, command=lambda: [choice.update({'piece': chess.QUEEN}), dlg.destroy()]).grid(row=1, column=0, padx=5, pady=5)
+        ttk.Button(dlg, text="♖", width=8, command=lambda: [choice.update({'piece': chess.ROOK}), dlg.destroy()]).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(dlg, text="♗", width=8, command=lambda: [choice.update({'piece': chess.BISHOP}), dlg.destroy()]).grid(row=1, column=2, padx=5, pady=5)
+        ttk.Button(dlg, text="♘", width=8, command=lambda: [choice.update({'piece': chess.KNIGHT}), dlg.destroy()]).grid(row=1, column=3, padx=5, pady=5)
+        dlg.wait_window()
+        return choice['piece']
+    
+    def ask_promotion_piece(self):
+        dlg = tk.Toplevel(self.window)
+        dlg.title("Promotion")
+        dlg.transient(self.window)
+        dlg.grab_set()
+        dlg.configure(bg=self.colors['panel_bg'])
+        choice = {'piece': None}
+
+        ttk.Label(dlg, text="Promote to", padding=10, style='Value.TLabel').grid(row=0, column=0, columnspan=4)
+        pieces = [
+            ('\u2655', chess.QUEEN),
+            ('\u2656', chess.ROOK),
+            ('\u2657', chess.BISHOP),
+            ('\u2658', chess.KNIGHT),
+        ]
+        for col, (label, piece_type) in enumerate(pieces):
+            ttk.Button(
+                dlg,
+                text=label,
+                width=6,
+                command=lambda pt=piece_type: [choice.update({'piece': pt}), dlg.destroy()]
+            ).grid(row=1, column=col, padx=6, pady=(0, 10))
         dlg.wait_window()
         return choice['piece']
 
     def make_move(self, move):
         san = self.board.san(move)
         self.board.push(move)
+        self.last_move = move
         self.move_history.append(san)
         self.update_move_history()
-
+    
     def ai_move(self):
-        if self.board.is_game_over():
-            self.game_over(); return
+        if self.ai.is_terminal_for_training(self.board):
+            self.game_over()
+            return
         self.ai_thinking = True
         self.status_var.set("AI thinking...")
         self.window.update()
         try:
-            # Pass the human's last move so the AI can reuse the subtree
-            move = self.ai.select_move(
+            move, policy_target = self.ai.select_move_with_policy(
                 self.board,
                 temperature=0.0,
                 use_mcts=True,
-                last_opponent_move=self._last_human_move,
+                add_dirichlet_noise=False
             )
-            self._last_human_move = None   # consumed
             if move:
+                self.record_human_learning_position(policy_target, move)
                 self.make_move(move)
                 self.status_var.set(f"AI: {self.move_history[-1]}")
                 self.update_board_display()
-                if self.board.is_game_over():
+                if self.ai.is_terminal_for_training(self.board):
                     self.game_over()
         except Exception as e:
             messagebox.showerror("Error", str(e))
         finally:
             self.ai_thinking = False
-
+    
     def start_game(self, color):
+        if self.is_training and self.learn_from_human_var.get():
+            messagebox.showwarning("Warning", "Stop self-play training before starting a learning game")
+            return
         self.board = chess.Board()
         self.human_color = color
+        self.player_vs_player_mode = False
+        self.ai_vs_ai_running = False
+        self.ai_vs_ai_paused = False
+        self.pause_button.config(text="Pause", state=tk.DISABLED)
         self.selected_square = None
         self.legal_moves_for_selected = []
         self.move_history = []
+        self.last_move = None
         self.ai_thinking = False
         self.flip_board = (color == chess.BLACK)
         self.flip_var.set(self.flip_board)
-        self._last_human_move = None
-        self.ai.reset_tree()        # ← clear any stale cached tree
+        self.reset_human_learning_game()
         self.update_board_display()
         self.update_move_history()
         self.status_var.set(f"You are {'White' if color == chess.WHITE else 'Black'}")
         if color == chess.BLACK:
             self.window.after(500, self.ai_move)
 
-    def watch_ai_game(self):
+    def start_player_vs_player(self):
+        if self.is_training and self.learn_from_human_var.get():
+            messagebox.showwarning("Warning", "Stop self-play training before starting a learning game")
+            return
         self.board = chess.Board()
         self.human_color = None
+        self.player_vs_player_mode = True
+        self.ai_vs_ai_running = False
+        self.ai_vs_ai_paused = False
+        self.pause_button.config(text="Pause", state=tk.DISABLED)
         self.selected_square = None
         self.legal_moves_for_selected = []
         self.move_history = []
+        self.last_move = None
+        self.ai_thinking = False
+        self.flip_board = False
+        self.flip_var.set(False)
+        self.reset_human_learning_game()
+        self.update_board_display()
+        self.update_move_history()
+        self.status_var.set("Player vs Player: White to move")
+    
+    def watch_ai_game(self):
+        self.board = chess.Board()
+        self.human_color = None
+        self.player_vs_player_mode = False
+        self.selected_square = None
+        self.legal_moves_for_selected = []
+        self.move_history = []
+        self.last_move = None
+        self.human_game_data = []
+        self.human_position_counts = self.ai.new_repetition_tracker()
+        self.human_game_start_time = None
         self.flip_board = False
         self.flip_var.set(False)
         self.ai_vs_ai_running = True
-        self.ai_vs_ai_paused  = False
+        self.ai_vs_ai_paused = False
         self.pause_button.config(text="Pause", state=tk.NORMAL)
-        self.ai.reset_tree()        # ← fresh tree for the demo game
         self.update_board_display()
         self.update_move_history()
         self.play_ai_vs_ai()
-
+    
     def play_ai_vs_ai(self):
         if not self.ai_vs_ai_running:
             return
         if self.ai_vs_ai_paused:
-            self.window.after(200, self.play_ai_vs_ai); return
-        if not self.board.is_game_over():
+            # Check again in 200ms without making a move
+            self.window.after(200, self.play_ai_vs_ai)
+            return
+        if not self.ai.is_terminal_for_training(self.board):
             try:
-                # In the demo, _last_human_move is None — the AI manages its
-                # own tree internally via self.ai._mcts_root across turns.
                 move = self.ai.select_move(self.board, temperature=0.1, use_mcts=True)
                 if move:
                     self.make_move(move)
@@ -1323,37 +2518,42 @@ class ChessGUI:
             self.ai_vs_ai_running = False
             self.pause_button.config(text="Pause", state=tk.DISABLED)
             self.game_over()
-
+    
     def reset_game(self):
-        self.ai_vs_ai_running = self.ai_vs_ai_paused = False
+        # Stop any running AI vs AI game first
+        self.ai_vs_ai_running = False
+        self.ai_vs_ai_paused = False
         self.pause_button.config(text="Pause", state=tk.DISABLED)
         self.board = chess.Board()
         self.human_color = None
+        self.player_vs_player_mode = False
         self.selected_square = None
         self.legal_moves_for_selected = []
         self.move_history = []
+        self.last_move = None
+        self.human_game_data = []
+        self.human_position_counts = self.ai.new_repetition_tracker()
+        self.human_game_start_time = None
         self.flip_board = False
         self.flip_var.set(False)
-        self._last_human_move = None
-        self.ai.reset_tree()
         self.update_board_display()
         self.update_move_history()
         self.status_var.set("Ready")
-
+    
     def game_over(self):
-        outcome = self.board.outcome()
+        outcome = self.board.outcome(claim_draw=True)
         if not outcome:
             msg = "Game ended"
         elif outcome.winner == chess.WHITE:
-            msg = "White wins!"
+            msg = "White wins"
         elif outcome.winner == chess.BLACK:
-            msg = "Black wins!"
+            msg = "Black wins"
         else:
             msg = "Draw"
-        self.ai.reset_tree()   # stale tree is no longer useful
+        msg += self.finish_human_learning_game()
         self.status_var.set(f"Game Over: {msg}")
         messagebox.showinfo("Game Over", msg)
-
+    
     def process_queue(self):
         try:
             while True:
@@ -1370,74 +2570,115 @@ class ChessGUI:
         except queue.Empty:
             pass
         self.window.after(100, self.process_queue)
-
+    
     def training_callback(self, game_num, total, p_loss, v_loss, reward, game_t, train_t):
-        result = ("Draw" if abs(reward - self.ai.draw_penalty) < 1e-6
-                  else ("Win(W)" if reward > 0 else "Win(B)"))
-        text = (f"Game {game_num}/{total}\n{result}\n"
-                f"P: {p_loss:.3f}  V: {v_loss:.3f}\n"
-                f"Game: {game_t:.1f}s  Train: {train_t:.1f}s")
+        result = "Draw" if self.ai.is_draw_reward(reward) else ("Win(W)" if reward > 0 else "Win(B)")
+        text = f"Game {game_num}/{total}\n{result}\nP: {p_loss:.3f} V: {v_loss:.3f}\nGame: {game_t:.1f}s Train: {train_t:.1f}s"
         self.message_queue.put({'type': 'training_update', 'text': text})
-
+    
     def train_worker(self, num, temp, temp_threshold):
         try:
-            self.ai.train(num_games=num, temperature=temp,
-                          temp_threshold=temp_threshold,
-                          callback=self.training_callback)
-            self.message_queue.put({'type': 'training_complete',
-                                    'text': f"Trained {num} games successfully."})
+            self.ai.train(num_games=num, temperature=temp, temp_threshold=temp_threshold, callback=self.training_callback)
+            self.message_queue.put({'type': 'training_complete', 'text': f"Trained {num} games"})
         except Exception as e:
             self.message_queue.put({'type': 'training_error', 'text': str(e)})
 
+    def reset_model(self):
+        if self.is_training:
+            messagebox.showwarning("Warning", "Stop training before starting fresh")
+            return
+        if not messagebox.askyesno("Fresh Start", "Archive the current checkpoint and start a fresh model?"):
+            return
+        try:
+            self.ai.reset_learning_state(archive_checkpoint=True)
+            self.update_stats_display()
+            self.progress_var.set("Fresh model initialized")
+            self.status_var.set("Fresh model initialized")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+    
     def start_training(self):
         if self.is_training:
-            messagebox.showwarning("Warning", "Already training"); return
+            messagebox.showwarning("Warning", "Already training")
+            return
         try:
-            num       = int(self.num_games_var.get())
-            temp      = float(self.temperature_var.get())
-            temp_thr  = int(self.temp_threshold_var.get())
-            if num <= 0 or temp <= 0 or temp_thr < 0:
+            num = int(self.num_games_var.get())
+            temp = float(self.temperature_var.get())
+            temp_threshold = int(self.temp_threshold_var.get())
+            mcts_sims = int(self.mcts_sims_var.get())
+            mcts_batch = int(self.mcts_batch_var.get())
+            train_steps = int(self.train_steps_var.get())
+            draw_penalty = float(self.draw_penalty_var.get())
+            repeat_penalty = float(self.repeat_penalty_var.get())
+            rep_draw_penalty = float(self.rep_draw_penalty_var.get())
+            stockfish_path = self.stockfish_path_var.get().strip() or None
+            stockfish_start = float(self.stockfish_start_var.get())
+            stockfish_end = float(self.stockfish_end_var.get())
+            stockfish_decay = int(self.stockfish_decay_var.get())
+            if num <= 0 or temp <= 0 or temp_threshold < 0 or mcts_sims <= 0 or mcts_batch <= 0 or train_steps < 0:
                 raise ValueError
-        except Exception:
-            messagebox.showerror("Error", "Invalid input"); return
+            if not (0.0 <= stockfish_start <= 1.0 and 0.0 <= stockfish_end <= 1.0 and stockfish_decay > 0):
+                raise ValueError
+        except:
+            messagebox.showerror("Error", "Invalid input")
+            return
+        self.ai.mcts_simulations = mcts_sims
+        self.ai.mcts_batch_size = mcts_batch
+        self.ai.train_steps_per_game = train_steps
+        self.ai.draw_penalty = draw_penalty
+        self.ai.repetition_penalty = repeat_penalty
+        self.ai.repetition_draw_penalty = rep_draw_penalty
+        if stockfish_path != self.ai.stockfish_path:
+            self.ai.close_stockfish_engine()
+            self.ai.stockfish_disabled_reason = ""
+        self.ai.stockfish_path = stockfish_path
+        self.ai.stockfish_teacher_start = stockfish_start
+        self.ai.stockfish_teacher_end = stockfish_end
+        self.ai.stockfish_teacher_decay_games = stockfish_decay
+        self.update_stats_display()
         self.is_training = True
         self.train_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
-        self.progress_var.set(f"Starting... (T={temp}, switch@move {temp_thr})")
-        self.training_thread = threading.Thread(
-            target=self.train_worker, args=(num, temp, temp_thr), daemon=True)
+        self.reset_model_button.config(state=tk.DISABLED)
+        self.progress_var.set(f"Starting... (Temp={temp}, Sims={mcts_sims}, Switch@move {temp_threshold})")
+        self.update_summary_display()
+        self.training_thread = threading.Thread(target=self.train_worker, args=(num, temp, temp_threshold), daemon=True)
         self.training_thread.start()
-
+    
     def stop_training(self):
         if self.is_training:
             self.ai.stop_training()
             self.window.after(1000, self.finish_stop_training)
         else:
             self.finish_stop_training()
-
+    
     def finish_stop_training(self):
         self.is_training = False
         self.train_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+        self.reset_model_button.config(state=tk.NORMAL)
         self.ai.save_model()
         self.update_stats_display()
         self.status_var.set("Ready")
-
+    
     def toggle_pause_ai_game(self):
         if not self.ai_vs_ai_running:
             return
         self.ai_vs_ai_paused = not self.ai_vs_ai_paused
         self.pause_button.config(text="Resume" if self.ai_vs_ai_paused else "Pause")
-        self.status_var.set("Paused" if self.ai_vs_ai_paused else "AI vs AI running...")
+        self.status_var.set("AI vs AI paused" if self.ai_vs_ai_paused else "AI vs AI running...")
+        self.update_summary_display()
 
     def copy_stats(self):
+        text = self.stats_text.get(1.0, tk.END).strip()
         self.window.clipboard_clear()
-        self.window.clipboard_append(self.stats_text.get(1.0, tk.END).strip())
+        self.window.clipboard_append(text)
         self.status_var.set("Stats copied to clipboard")
 
     def copy_moves(self):
+        text = self.history_text.get(1.0, tk.END).strip()
         self.window.clipboard_clear()
-        self.window.clipboard_append(self.history_text.get(1.0, tk.END).strip())
+        self.window.clipboard_append(text)
         self.status_var.set("Move history copied to clipboard")
 
     def run(self):
