@@ -98,6 +98,8 @@ class ChessAI:
             self.visits = 0
             self.value_sum = 0.0
             self.virtual_loss_count = 0
+            self.legal_moves = None
+            self.legal_indices = None
 
         @property
         def q_value(self):
@@ -135,7 +137,13 @@ class ChessAI:
                  prioritized_replay_alpha=0.6,
                  priority_epsilon=1e-3,
                  human_policy_weight=0.25,
-                 use_amp=True):
+                 use_amp=True,
+                 resignation_threshold=-0.9,
+                 resignation_consecutive_plies=5,
+                 opening_random_plies=2,
+                 evaluation_games=4,
+                 evaluation_interval=50,
+                 parallel_games=8):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ChessNet().to(self.device)
@@ -184,6 +192,11 @@ class ChessAI:
             'stockfish_games': 0,
             'stockfish_positions': 0,
             'stockfish_unavailable_games': 0,
+            'resigned_games': 0,
+            'evaluation_games': 0,
+            'evaluation_wins': 0,
+            'evaluation_losses': 0,
+            'evaluation_draws': 0,
         }
         self.stop_training_flag = False
         
@@ -205,7 +218,11 @@ class ChessAI:
         self.mcts_c_puct = mcts_c_puct
         self.mcts_dirichlet_eps = mcts_dirichlet_eps
         self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
-        self.stockfish_path = stockfish_path or os.environ.get("STOCKFISH_PATH") or shutil.which("stockfish")
+        self.stockfish_path = (
+            stockfish_path
+            if stockfish_path is not None
+            else os.environ.get("STOCKFISH_PATH") or shutil.which("stockfish")
+        )
         self.stockfish_time_limit = stockfish_time_limit
         self.stockfish_depth = stockfish_depth
         self.stockfish_top_moves = stockfish_top_moves
@@ -214,9 +231,17 @@ class ChessAI:
         self.stockfish_teacher_decay_games = stockfish_teacher_decay_games
         self.stockfish_engine = None
         self.stockfish_disabled_reason = ""
+        self.last_evaluation_replays = []
+        self.evaluation_replay_version = 0
         self.prioritized_replay_alpha = prioritized_replay_alpha
         self.priority_epsilon = priority_epsilon
         self.human_policy_weight = human_policy_weight
+        self.resignation_threshold = float(resignation_threshold)
+        self.resignation_consecutive_plies = max(1, int(resignation_consecutive_plies))
+        self.opening_random_plies = max(0, int(opening_random_plies))
+        self.evaluation_games = max(0, int(evaluation_games))
+        self.evaluation_interval = max(1, int(evaluation_interval))
+        self.parallel_games = max(1, int(parallel_games))
         
         self.data_counter = 0
         self.loss_history = deque(maxlen=100)
@@ -249,6 +274,11 @@ class ChessAI:
             'stockfish_games': 0,
             'stockfish_positions': 0,
             'stockfish_unavailable_games': 0,
+            'resigned_games': 0,
+            'evaluation_games': 0,
+            'evaluation_wins': 0,
+            'evaluation_losses': 0,
+            'evaluation_draws': 0,
         }
 
     def reset_learning_state(self, archive_checkpoint=True):
@@ -718,11 +748,14 @@ class ChessAI:
     # -------------------------
     # Batched network inference
     # -------------------------
-    def evaluate_batch(self, board_list):
+    def evaluate_batch(self, board_list, nodes=None, model=None):
         if len(board_list) == 0:
             return []
+        if nodes is not None and len(nodes) != len(board_list):
+            raise ValueError("nodes must match board_list length")
         
-        self.model.eval()
+        model = self.model if model is None else model
+        model.eval()
         with torch.no_grad():
             board_tensors = [self.board_to_tensor(board) for board in board_list]
             batch_tensor = torch.cat(board_tensors, dim=0).to(self.device)
@@ -731,13 +764,21 @@ class ChessAI:
 
             legal_moves_batch = []
             legal_indices_batch = []
-            for board in board_list:
-                flip = (board.turn == chess.BLACK)
-                legal_moves = list(board.legal_moves)
-                legal_indices = [
-                    self.move_to_index(move, flip=flip)
-                    for move in legal_moves
-                ]
+            for i, board in enumerate(board_list):
+                node = nodes[i] if nodes is not None else None
+                if node is not None and node.legal_moves is not None:
+                    legal_moves = node.legal_moves
+                    legal_indices = node.legal_indices
+                else:
+                    flip = (board.turn == chess.BLACK)
+                    legal_moves = list(board.legal_moves)
+                    legal_indices = [
+                        self.move_to_index(move, flip=flip)
+                        for move in legal_moves
+                    ]
+                    if node is not None:
+                        node.legal_moves = legal_moves
+                        node.legal_indices = legal_indices
                 legal_moves_batch.append(legal_moves)
                 legal_indices_batch.append([
                     idx for idx in legal_indices
@@ -745,7 +786,7 @@ class ChessAI:
                 ])
 
             with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-                policy_logits, values = self.model(batch_tensor)
+                policy_logits, values = model(batch_tensor)
 
             policy_logits = torch.nan_to_num(
                 policy_logits.float(),
@@ -807,14 +848,15 @@ class ChessAI:
                 results.append((legal_move_probs, value))
             return results
     
-    def get_move_probabilities(self, board):
-        results = self.evaluate_batch([board])
+    def get_move_probabilities(self, board, model=None):
+        results = self.evaluate_batch([board], model=model)
         return results[0] if results else ([], 0.0)
     
     # -------------------------
     # Batched MCTS
     # -------------------------
-    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False, game_position_counts=None):
+    def run_mcts_batched(self, root_board, simulations=None, add_dirichlet_noise=False,
+                         game_position_counts=None, model=None):
         """
         Run MCTS with batched neural network evaluation and CORRECT virtual loss.
 
@@ -828,7 +870,7 @@ class ChessAI:
             game_position_counts = {}
         
         root = self.MCTSNode(root_board.copy(), parent=None, prior=0.0)
-        move_probs, value = self.get_move_probabilities(root.board)
+        move_probs, value = self.evaluate_batch([root.board], nodes=[root], model=model)[0]
         for move, prob in move_probs:
             child_board = root.board.copy()
             child_board.push(move)
@@ -881,6 +923,7 @@ class ChessAI:
                 leaf_nodes.append(node)
             
             boards_to_evaluate = []
+            nodes_to_evaluate = []
             terminal_values = []
             terminal_draws = []
             eval_index_map = []
@@ -891,12 +934,15 @@ class ChessAI:
                     terminal_draws.append(self.is_draw_result(node.board))
                 else:
                     boards_to_evaluate.append(node.board)
+                    nodes_to_evaluate.append(node)
                     terminal_values.append(None)
                     terminal_draws.append(False)
                     eval_index_map.append(idx)
             
             if boards_to_evaluate:
-                eval_results = self.evaluate_batch(boards_to_evaluate)
+                eval_results = self.evaluate_batch(
+                    boards_to_evaluate, nodes=nodes_to_evaluate, model=model
+                )
             else:
                 eval_results = []
             
@@ -944,6 +990,90 @@ class ChessAI:
                     value_to_propagate = -value_to_propagate
         
         return root
+
+    def run_mcts_parallel(self, root_boards, simulations=None, add_dirichlet_noise=False,
+                          game_position_counts=None, model=None):
+        """Run independent searches for several games while batching their leaves."""
+        if simulations is None:
+            simulations = self.mcts_simulations
+        counts = game_position_counts or [{} for _ in root_boards]
+        roots = [self.MCTSNode(board.copy()) for board in root_boards]
+        initial = self.evaluate_batch([r.board for r in roots], nodes=roots, model=model)
+        for root, (move_probs, _) in zip(roots, initial):
+            for move, prob in move_probs:
+                child_board = root.board.copy()
+                child_board.push(move)
+                root.children[move] = self.MCTSNode(
+                    child_board, parent=root,
+                    prior=float(prob) if np.isfinite(prob) and prob > 0 else 0.0)
+            if add_dirichlet_noise and root.children:
+                moves = list(root.children)
+                noise = np.random.dirichlet([self.mcts_dirichlet_alpha] * len(moves))
+                for move, n in zip(moves, noise):
+                    root.children[move].prior = (
+                        (1 - self.mcts_dirichlet_eps) * root.children[move].prior
+                        + self.mcts_dirichlet_eps * n
+                    )
+
+        for start in range(0, simulations, self.mcts_batch_size):
+            paths, leaves, owners = [], [], []
+            batch_end = min(simulations, start + self.mcts_batch_size)
+            for game_index, root in enumerate(roots):
+                for _ in range(batch_end - start):
+                    node, path = root, [root]
+                    while node.children:
+                        total = sum(c.visits + c.virtual_loss_count
+                                    for c in node.children.values()) + 1
+                        best_move, best_score = None, -1e9
+                        for move, child in node.children.items():
+                            q = -child.q_value
+                            repeats = self.repetition_count_for_board(child.board, counts[game_index])
+                            q = float(np.clip(q + self.repetition_penalty_for_visits(repeats), -1, 1))
+                            prior = child.prior if np.isfinite(child.prior) and child.prior > 0 else 0.0
+                            score = q + self.mcts_c_puct * prior * math.sqrt(total) / (
+                                1 + child.visits + child.virtual_loss_count)
+                            if score > best_score:
+                                best_score, best_move = score, move
+                        if best_move is None:
+                            break
+                        node = node.children[best_move]
+                        node.virtual_loss_count += 1
+                        path.append(node)
+                    paths.append(path)
+                    leaves.append(node)
+                    owners.append(game_index)
+
+            values, draw_flags, eval_nodes, eval_indices = [None] * len(leaves), [False] * len(leaves), [], []
+            for index, node in enumerate(leaves):
+                if self.is_terminal_for_training(node.board):
+                    values[index] = self.terminal_value_for_side_to_move(node.board)
+                    draw_flags[index] = self.is_draw_result(node.board)
+                else:
+                    eval_nodes.append(node)
+                    eval_indices.append(index)
+            if eval_nodes:
+                results = self.evaluate_batch([n.board for n in eval_nodes], nodes=eval_nodes, model=model)
+                for index, node, (move_probs, value) in zip(eval_indices, eval_nodes, results):
+                    repeats = self.repetition_count_for_board(node.board, counts[owners[index]])
+                    values[index] = float(np.clip(
+                        value + self.repetition_penalty_for_visits(repeats), -1, 1))
+                    for move, prob in move_probs:
+                        if move not in node.children:
+                            child_board = node.board.copy()
+                            child_board.push(move)
+                            node.children[move] = self.MCTSNode(
+                                child_board, parent=node,
+                                prior=float(prob) if np.isfinite(prob) and prob > 0 else 0.0)
+            for path, value, is_draw in zip(paths, values, draw_flags):
+                if value is None:
+                    continue
+                for node in reversed(path):
+                    node.visits += 1
+                    node.value_sum += value
+                    node.virtual_loss_count = max(0, node.virtual_loss_count - 1)
+                    if not is_draw:
+                        value = -value
+        return roots
     
     # -------------------------
     # Move selection
@@ -969,10 +1099,10 @@ class ChessAI:
         return moves, visits, probs
 
     def select_move_with_policy(self, board, temperature=1.0, use_mcts=True,
-                                add_dirichlet_noise=False, game_position_counts=None):
+                                add_dirichlet_noise=False, game_position_counts=None, model=None):
         flip = (board.turn == chess.BLACK)
         if not use_mcts:
-            move_probs, _ = self.get_move_probabilities(board)
+            move_probs, _ = self.get_move_probabilities(board, model=model)
             if not move_probs:
                 return None, ()
             moves, probs = zip(*move_probs)
@@ -995,7 +1125,8 @@ class ChessAI:
 
         root = self.run_mcts_batched(board, simulations=self.mcts_simulations,
                                      add_dirichlet_noise=add_dirichlet_noise,
-                                     game_position_counts=game_position_counts)
+                                     game_position_counts=game_position_counts, model=model)
+        self._last_root_q_value = root.q_value
         moves, _, probs = self.mcts_policy_from_root(root, temperature=temperature)
         if not moves:
             return None, ()
@@ -1010,19 +1141,131 @@ class ChessAI:
         )
         return moves[selected_idx], policy_target
 
-    def select_move(self, board, temperature=1.0, use_mcts=True, add_dirichlet_noise=False, game_position_counts=None):
+    def select_move(self, board, temperature=1.0, use_mcts=True,
+                    add_dirichlet_noise=False, game_position_counts=None, model=None):
         move, _ = self.select_move_with_policy(
             board,
             temperature=temperature,
             use_mcts=use_mcts,
             add_dirichlet_noise=add_dirichlet_noise,
-            game_position_counts=game_position_counts
+            game_position_counts=game_position_counts,
+            model=model
         )
         return move
     
     # -------------------------
     # Self-play with repetition-aware search
     # -------------------------
+    def play_games_parallel(self, num_games=None, temperature=1.0, max_moves=200,
+                            temp_threshold=30):
+        """Play up to ``num_games`` self-play games, batching MCTS leaves."""
+        total_games = self.parallel_games if num_games is None else max(0, int(num_games))
+        if total_games == 0:
+            return []
+        active_limit = min(self.parallel_games, total_games)
+        states = [{
+            'board': chess.Board(), 'data': [], 'counts': self.new_repetition_tracker(),
+            'move_count': 0, 'low_value_plies': 0, 'resigned': False, 'root_q': None
+        } for _ in range(active_limit)]
+        results = []
+        games_started = active_limit
+        while states and not self.stop_training_flag:
+            search_states = []
+            for state in states:
+                board = state['board']
+                if self.is_terminal_for_training(board) or state['move_count'] >= max_moves:
+                    continue
+                visit_count = self.repetition_count_for_board(board, state['counts'])
+                self.record_position_visit(board, state['counts'])
+                if visit_count > 0:
+                    self.training_stats['repetition_penalties_applied'] += 1
+                can_flip = self.is_position_symmetric_safe(board)
+                board_tensor = self.board_to_tensor(board).cpu()
+                legal_indices = self.legal_policy_indices(board)
+                if state['move_count'] < self.opening_random_plies:
+                    moves = list(board.legal_moves)
+                    if moves:
+                        move = random.choice(moves)
+                        prob = 1.0 / len(moves)
+                        policy = tuple((self.move_to_index(m, flip=board.turn == chess.BLACK), prob)
+                                       for m in moves)
+                        state['data'].append((board_tensor, policy, legal_indices, board.turn,
+                                              can_flip, 0.0, None, 1.0))
+                        board.push(move)
+                        state['move_count'] += 1
+                else:
+                    search_states.append((state, board_tensor, legal_indices, can_flip))
+
+            if search_states:
+                roots = self.run_mcts_parallel(
+                    [s[0]['board'] for s in search_states],
+                    simulations=self.mcts_simulations,
+                    add_dirichlet_noise=True,
+                    game_position_counts=[s[0]['counts'] for s in search_states])
+                for (state, board_tensor, legal_indices, can_flip), root in zip(search_states, roots):
+                    self._last_root_q_value = root.q_value
+                    state['root_q'] = root.q_value
+                    state['low_value_plies'] = state['low_value_plies'] + 1 if (
+                        root.q_value < self.resignation_threshold) else 0
+                    if state['low_value_plies'] >= self.resignation_consecutive_plies:
+                        state['resigned'] = True
+                        self.training_stats['resigned_games'] += 1
+                        continue
+                    moves, _, probs = self.mcts_policy_from_root(root, temperature=(
+                        temperature if state['move_count'] < temp_threshold else 0.0))
+                    if not moves:
+                        continue
+                    selection = self.normalize_probabilities(
+                        self.avoid_repeated_position_probs(
+                            state['board'], moves, probs, state['counts']))
+                    move = moves[self.safe_choice_index(len(moves), selection)]
+                    policy = tuple((self.move_to_index(m, flip=state['board'].turn == chess.BLACK), float(p))
+                                   for m, p in zip(moves, probs) if p > 0)
+                    state['data'].append((board_tensor, policy, legal_indices, state['board'].turn,
+                                          can_flip, 0.0, None, 1.0))
+                    state['board'].push(move)
+                    state['move_count'] += 1
+
+            finished = [s for s in states if self.is_terminal_for_training(s['board']) or
+                        s['move_count'] >= max_moves or s['resigned']]
+            for state in finished:
+                board, outcome = state['board'], state['board'].outcome(claim_draw=True)
+                if state['resigned']:
+                    reward = -1.0 if board.turn == chess.WHITE else 1.0
+                elif outcome and outcome.winner == chess.WHITE:
+                    reward = 1.0; self.training_stats['white_wins'] += 1
+                elif outcome and outcome.winner == chess.BLACK:
+                    reward = -1.0; self.training_stats['black_wins'] += 1
+                else:
+                    reward = self.draw_value_for_board(board)
+                    self.training_stats['draws'] += 1
+                    if state['move_count'] >= max_moves:
+                        self.training_stats['max_move_draws'] += 1
+                        self.training_stats['last_draw_reason'] = 'max moves'
+                    else:
+                        self.training_stats['rule_draws'] += 1
+                        self.training_stats['last_draw_reason'] = (
+                            outcome.termination.name.lower() if outcome else 'unknown')
+                self.training_stats['games_played'] += 1
+                self.training_stats['total_moves'] += len(state['data'])
+                self.training_stats['last_game_moves'] = len(state['data'])
+                state['result'] = (state['data'], reward)
+                results.append(state['result'])
+            finished_ids = {id(s) for s in finished}
+            states = [s for s in states if id(s) not in finished_ids]
+            # Recycle each completed slot immediately so the leaf-evaluation
+            # batch remains full until the requested number of games starts.
+            while len(states) < active_limit and games_started < total_games:
+                states.append({
+                    'board': chess.Board(), 'data': [],
+                    'counts': self.new_repetition_tracker(), 'move_count': 0,
+                    'low_value_plies': 0, 'resigned': False, 'root_q': None
+                })
+                games_started += 1
+        for state in states:
+            results.append((state['data'], self.draw_penalty))
+        return results
+
     def play_game(self, temperature=1.0, max_moves=200, temp_threshold=30):
         """
         Play a self-play game.
@@ -1034,6 +1277,9 @@ class ChessAI:
         board = chess.Board()
         game_data = []
         move_count = 0
+        self._last_root_q_value = None
+        low_root_value_plies = 0
+        resigned = False
 
         # Track exact positions and piece layouts. Layout repeats catch shuffling
         # cycles even when side-to-move, castling, or en-passant state differs.
@@ -1050,13 +1296,32 @@ class ChessAI:
             legal_indices = self.legal_policy_indices(board)
 
             current_temp = temperature if move_count < temp_threshold else 0.0
-            move, policy_target = self.select_move_with_policy(
-                board,
-                temperature=current_temp,
-                use_mcts=True,
-                add_dirichlet_noise=True,
-                game_position_counts=position_counts
-            )
+            if move_count < self.opening_random_plies:
+                legal_moves = list(board.legal_moves)
+                if not legal_moves:
+                    break
+                move = random.choice(legal_moves)
+                uniform_prob = 1.0 / len(legal_moves)
+                policy_target = tuple(
+                    (self.move_to_index(legal_move, flip=(board.turn == chess.BLACK)), uniform_prob)
+                    for legal_move in legal_moves
+                )
+            else:
+                move, policy_target = self.select_move_with_policy(
+                    board,
+                    temperature=current_temp,
+                    use_mcts=True,
+                    add_dirichlet_noise=True,
+                    game_position_counts=position_counts
+                )
+                if self._last_root_q_value < self.resignation_threshold:
+                    low_root_value_plies += 1
+                else:
+                    low_root_value_plies = 0
+                if low_root_value_plies >= self.resignation_consecutive_plies:
+                    resigned = True
+                    self.training_stats['resigned_games'] += 1
+                    break
 
             if move is None:
                 break
@@ -1070,12 +1335,14 @@ class ChessAI:
             board.push(move)
             move_count += 1
 
-            if len(game_data) > max_moves:
+            if len(game_data) >= max_moves:
                 break
 
         # Assign end-of-game reward
         outcome = board.outcome(claim_draw=True)
-        if outcome and outcome.winner == chess.WHITE:
+        if resigned:
+            reward = -1.0 if board.turn == chess.WHITE else 1.0
+        elif outcome and outcome.winner == chess.WHITE:
             reward = 1.0
             self.training_stats['white_wins'] += 1
         elif outcome and outcome.winner == chess.BLACK:
@@ -1084,7 +1351,7 @@ class ChessAI:
         else:
             reward = self.draw_value_for_board(board)
             self.training_stats['draws'] += 1
-            if len(game_data) > max_moves:
+            if len(game_data) >= max_moves:
                 self.training_stats['max_move_draws'] += 1
                 self.training_stats['last_draw_reason'] = 'max moves'
             else:
@@ -1107,6 +1374,8 @@ class ChessAI:
         board = chess.Board()
         game_data = []
         move_count = 0
+        low_root_value_plies = 0
+        resigned = False
         position_counts = self.new_repetition_tracker()
 
         while not self.is_terminal_for_training(board) and not self.stop_training_flag:
@@ -1119,6 +1388,15 @@ class ChessAI:
                 return self.play_game(temperature, max_moves=max_moves, temp_threshold=temp_threshold)
 
             move_probs, teacher_value = teacher
+            # Teacher games retain Stockfish's opening policy; random openings apply to self-play only.
+            if move_count >= self.opening_random_plies and teacher_value < self.resignation_threshold:
+                low_root_value_plies += 1
+            else:
+                low_root_value_plies = 0
+            if low_root_value_plies >= self.resignation_consecutive_plies:
+                resigned = True
+                self.training_stats['resigned_games'] += 1
+                break
             moves, probs = zip(*move_probs)
             current_temp = temperature if move_count < temp_threshold else 0.0
             if current_temp == 0 or current_temp < 1e-8:
@@ -1142,11 +1420,13 @@ class ChessAI:
 
             board.push(move)
             move_count += 1
-            if len(game_data) > max_moves:
+            if len(game_data) >= max_moves:
                 break
 
         outcome = board.outcome(claim_draw=True)
-        if outcome and outcome.winner == chess.WHITE:
+        if resigned:
+            reward = -1.0 if board.turn == chess.WHITE else 1.0
+        elif outcome and outcome.winner == chess.WHITE:
             reward = 1.0
             self.training_stats['white_wins'] += 1
         elif outcome and outcome.winner == chess.BLACK:
@@ -1155,7 +1435,7 @@ class ChessAI:
         else:
             reward = self.draw_value_for_board(board)
             self.training_stats['draws'] += 1
-            if len(game_data) > max_moves:
+            if len(game_data) >= max_moves:
                 self.training_stats['max_move_draws'] += 1
                 self.training_stats['last_draw_reason'] = 'max moves'
             else:
@@ -1524,43 +1804,102 @@ class ChessAI:
             avg_policy_loss /= steps_done
             avg_value_loss /= steps_done
         return avg_policy_loss, avg_value_loss, steps_done, train_time
+
+    def evaluate_against_previous_checkpoint(self, games=None):
+        games = self.evaluation_games if games is None else max(0, int(games))
+        model_path = os.path.join(self.save_dir, "model_latest.pth")
+        if games <= 0 or not os.path.exists(model_path):
+            return None
+
+        checkpoint = torch.load(model_path, map_location='cpu')
+        previous_state = checkpoint.get('model_state_dict')
+        if not previous_state:
+            return None
+        previous_model = ChessNet().to(self.device)
+        previous_model.load_state_dict(previous_state)
+        if self.device.type == 'cuda':
+            previous_model = previous_model.to(memory_format=torch.channels_last)
+        previous_model.eval()
+        current_model = self.model
+        current_model.eval()
+        results = {'wins': 0, 'losses': 0, 'draws': 0}
+        replay_games = []
+        try:
+            for game_index in range(games):
+                board = chess.Board()
+                position_counts = self.new_repetition_tracker()
+                replay = {'moves': [], 'evaluations': [], 'positions': [board.fen()]}
+                while not self.is_terminal_for_training(board) and len(board.move_stack) < 200:
+                    model = current_model if board.turn == chess.WHITE else previous_model
+                    move = self.select_move(
+                        board, temperature=0.0, use_mcts=True,
+                        add_dirichlet_noise=False, game_position_counts=position_counts,
+                        model=model
+                    )
+                    if move is None:
+                        break
+                    replay['moves'].append(move.uci())
+                    replay['evaluations'].append(float(getattr(self, '_last_root_q_value', 0.0)))
+                    self.record_position_visit(board, position_counts)
+                    board.push(move)
+                    replay['positions'].append(board.fen())
+
+                outcome = board.outcome(claim_draw=True)
+                if outcome is None or outcome.winner is None:
+                    results['draws'] += 1
+                elif outcome.winner == chess.WHITE:
+                    results['wins'] += 1
+                else:
+                    results['losses'] += 1
+                replay['result'] = (
+                    'Draw' if outcome is None or outcome.winner is None
+                    else ('White wins' if outcome.winner == chess.WHITE else 'Black wins')
+                )
+                replay_games.append(replay)
+        finally:
+            current_model.train()
+
+        self.training_stats['evaluation_games'] += games
+        self.training_stats['evaluation_wins'] += results['wins']
+        self.training_stats['evaluation_losses'] += results['losses']
+        self.training_stats['evaluation_draws'] += results['draws']
+        self.last_evaluation_replays = replay_games
+        self.evaluation_replay_version += 1
+        return results
     
     def train(self, num_games=10, temperature=1.0, temp_threshold=30, callback=None):
         self.stop_training_flag = False
-        
-        for game_num in range(num_games):
-            if self.stop_training_flag:
-                break
-            
+        game_num = 0
+        while game_num < num_games and not self.stop_training_flag:
+            batch_size = min(self.parallel_games, num_games - game_num)
             game_start = time.time()
             if self.should_use_stockfish_teacher():
-                game_data, reward = self.play_stockfish_teacher_game(
-                    temperature,
-                    temp_threshold=temp_threshold
-                )
+                batch = [self.play_stockfish_teacher_game(
+                    temperature, temp_threshold=temp_threshold)]
             else:
-                game_data, reward = self.play_game(temperature, temp_threshold=temp_threshold)
-            game_time = time.time() - game_start
-            
-            self.add_game_to_buffer(game_data, reward)
-            
-            if game_num % 10 == 0:
-                self.clean_old_data()
-            
-            avg_policy_loss, avg_value_loss, steps_done, train_time = self.train_from_replay(
-                steps=self.train_steps_per_game,
-                require_min_buffer=True
-            )
-            self.training_stats['total_game_time'] += game_time
-            self.training_stats['total_train_time'] += train_time
-            self.training_stats['last_game_time'] = game_time
-            self.training_stats['last_train_time'] = train_time
-            
-            if callback:
-                callback(game_num + 1, num_games, avg_policy_loss, avg_value_loss, reward, game_time, train_time)
-            
-            if (game_num + 1) % 10 == 0:
-                self.save_model()
+                batch = self.play_games_parallel(
+                    batch_size, temperature=temperature, temp_threshold=temp_threshold)
+            elapsed = time.time() - game_start
+            per_game_time = elapsed / max(1, len(batch))
+            for game_data, reward in batch:
+                if game_num >= num_games:
+                    break
+                self.add_game_to_buffer(game_data, reward)
+                if game_num % 10 == 0:
+                    self.clean_old_data()
+                p_loss, v_loss, steps_done, train_time = self.train_from_replay(
+                    steps=self.train_steps_per_game, require_min_buffer=True)
+                self.training_stats['total_game_time'] += per_game_time
+                self.training_stats['total_train_time'] += train_time
+                self.training_stats['last_game_time'] = per_game_time
+                self.training_stats['last_train_time'] = train_time
+                game_num += 1
+                if callback:
+                    callback(game_num, num_games, p_loss, v_loss, reward, per_game_time, train_time)
+                if game_num % self.evaluation_interval == 0:
+                    self.evaluate_against_previous_checkpoint()
+                if game_num % 10 == 0:
+                    self.save_model()
     
     def stop_training(self):
         self.stop_training_flag = True
@@ -1668,6 +2007,14 @@ class ChessGUI:
         self.human_game_data = []
         self.human_position_counts = self.ai.new_repetition_tracker()
         self.human_game_start_time = None
+        self.evaluation_replays = []
+        self.replay_game_index = 0
+        self.replay_ply = 0
+        self.replay_board = chess.Board()
+        self.replay_playing = False
+        self.replay_mode = False
+        self.replay_delay_ms = 400
+        self._seen_evaluation_replays = 0
         
         self.setup_gui()
         self.process_queue()
@@ -1809,6 +2156,12 @@ class ChessGUI:
         self.stockfish_start_var = tk.StringVar(value=str(self.ai.stockfish_teacher_start))
         self.stockfish_end_var = tk.StringVar(value=str(self.ai.stockfish_teacher_end))
         self.stockfish_decay_var = tk.StringVar(value=str(self.ai.stockfish_teacher_decay_games))
+        self.resignation_threshold_var = tk.StringVar(value=str(self.ai.resignation_threshold))
+        self.resignation_plies_var = tk.StringVar(value=str(self.ai.resignation_consecutive_plies))
+        self.opening_random_plies_var = tk.StringVar(value=str(self.ai.opening_random_plies))
+        self.evaluation_games_var = tk.StringVar(value=str(self.ai.evaluation_games))
+        self.evaluation_interval_var = tk.StringVar(value=str(self.ai.evaluation_interval))
+        self.parallel_games_var = tk.StringVar(value=str(self.ai.parallel_games))
 
         add_entry(0, "Games", self.num_games_var)
         add_entry(1, "Temperature", self.temperature_var)
@@ -1823,9 +2176,15 @@ class ChessGUI:
         add_entry(10, "Teacher start", self.stockfish_start_var)
         add_entry(11, "Teacher end", self.stockfish_end_var)
         add_entry(12, "Teacher decay games", self.stockfish_decay_var)
+        add_entry(13, "Resignation threshold", self.resignation_threshold_var)
+        add_entry(14, "Resignation plies", self.resignation_plies_var)
+        add_entry(15, "Random opening plies", self.opening_random_plies_var)
+        add_entry(16, "Evaluation games", self.evaluation_games_var)
+        add_entry(17, "Evaluation interval", self.evaluation_interval_var, "training games")
+        add_entry(18, "Parallel games", self.parallel_games_var)
         
         button_frame = ttk.Frame(train_frame)
-        button_frame.grid(row=13, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(12, 4))
+        button_frame.grid(row=19, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(12, 4))
         for col in range(3):
             button_frame.columnconfigure(col, weight=1)
         
@@ -1857,6 +2216,19 @@ class ChessGUI:
         ttk.Button(play_frame, text="New Game", command=self.reset_game).grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
         ttk.Checkbutton(play_frame, text="Flip board", variable=self.flip_var, command=self.on_flip_toggle).grid(row=4, column=0, sticky=tk.W, pady=(12, 4))
         ttk.Checkbutton(play_frame, text="Learn from my games", variable=self.learn_from_human_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=4)
+        replay_frame = ttk.LabelFrame(play_tab, text="Evaluation Replay", padding=12, style='Card.TLabelframe')
+        replay_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(12, 0))
+        self.replay_game_var = tk.StringVar(value="No evaluation games")
+        self.replay_info_var = tk.StringVar(value="Run an evaluation cycle to record games.")
+        ttk.Label(replay_frame, textvariable=self.replay_game_var).grid(row=0, column=0, columnspan=4, sticky=tk.W)
+        ttk.Label(replay_frame, textvariable=self.replay_info_var, style='Muted.TLabel').grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(4, 8))
+        ttk.Button(replay_frame, text="Game -", command=lambda: self.select_replay_game(-1)).grid(row=2, column=0, sticky=(tk.W, tk.E), padx=(0, 4))
+        ttk.Button(replay_frame, text="Game +", command=lambda: self.select_replay_game(1)).grid(row=2, column=1, sticky=(tk.W, tk.E), padx=4)
+        ttk.Button(replay_frame, text="Restart", command=self.restart_replay).grid(row=2, column=2, sticky=(tk.W, tk.E), padx=4)
+        self.replay_pause_button = ttk.Button(replay_frame, text="Play", command=self.toggle_replay)
+        self.replay_pause_button.grid(row=2, column=3, sticky=(tk.W, tk.E), padx=(4, 0))
+        ttk.Button(replay_frame, text="Previous", command=lambda: self.step_replay(-1)).grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0), padx=(0, 4))
+        ttk.Button(replay_frame, text="Next", command=lambda: self.step_replay(1)).grid(row=3, column=2, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0), padx=(4, 0))
         
         stats_frame = ttk.LabelFrame(stats_tab, text="Training Statistics", padding=12, style='Card.TLabelframe')
         stats_frame.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
@@ -1922,7 +2294,7 @@ class ChessGUI:
                 x2 = x1 + self.square_size
                 y2 = y1 + self.square_size
                 square = chess.square(file, rank)
-                if square == self.selected_square:
+                if square == self.selected_square and not self.replay_replays_active():
                     color = selected_color
                 elif square in [move.to_square for move in self.legal_moves_for_selected]:
                     color = legal_move_color
@@ -1978,6 +2350,8 @@ class ChessGUI:
         return ImageTk.PhotoImage(image)
     
     def board_to_image(self):
+        display_board = self.replay_board if self.replay_replays_active() else self.board
+        display_last_move = self.replay_last_move()
         board_size = self.square_size * 8
         offset = 32
         margin = offset * 2
@@ -2001,11 +2375,14 @@ class ChessGUI:
             fill=self.colors['board_edge']
         )
 
-        legal_targets = {move.to_square for move in self.legal_moves_for_selected}
+        legal_targets = (
+            {move.to_square for move in self.legal_moves_for_selected}
+            if not self.replay_replays_active() else set()
+        )
         last_move_squares = set()
-        if self.last_move:
-            last_move_squares = {self.last_move.from_square, self.last_move.to_square}
-        check_square = self.board.king(self.board.turn) if self.board.is_check() else None
+        if display_last_move:
+            last_move_squares = {display_last_move.from_square, display_last_move.to_square}
+        check_square = display_board.king(display_board.turn) if display_board.is_check() else None
 
         for rank in range(8):
             for file in range(8):
@@ -2033,7 +2410,7 @@ class ChessGUI:
                 draw.rectangle([x1, y1, x2, y2], fill=color)
                 if square in legal_targets:
                     center = (x1 + self.square_size // 2, y1 + self.square_size // 2)
-                    if self.board.piece_at(square):
+                    if display_board.piece_at(square):
                         inset = 8
                         draw.ellipse(
                             [x1 + inset, y1 + inset, x2 - inset, y2 - inset],
@@ -2071,7 +2448,7 @@ class ChessGUI:
         for rank in range(8):
             for file in range(8):
                 square = chess.square(file, rank)
-                piece = self.board.piece_at(square)
+                piece = display_board.piece_at(square)
                 if piece:
                     piece_char = piece_symbols.get(piece.symbol(), piece.symbol())
                     if not self.flip_board:
@@ -2158,6 +2535,8 @@ Human train steps: {stats.get('human_train_steps', 0)}
 Stockfish games: {stats.get('stockfish_games', 0)}
 Stockfish positions: {stats.get('stockfish_positions', 0)}
 Stockfish skipped: {stats.get('stockfish_unavailable_games', 0)}
+Resigned games: {stats.get('resigned_games', 0)}
+Eval (current vs previous): {stats.get('evaluation_wins', 0)}-{stats.get('evaluation_losses', 0)}-{stats.get('evaluation_draws', 0)}
 Last game: {last_moves} moves, {last_game_time:.1f}s
 Avg game: {avg_game_time:.1f}s, {avg_moves:.1f} moves
 Avg train: {avg_train_time:.2f}s
@@ -2307,6 +2686,8 @@ Model: {self.ai.save_dir}""".strip()
         return f"\nSaved {positions} positions to replay."
     
     def on_board_click(self, event):
+        if self.replay_replays_active():
+            return
         active_color = self.active_human_color()
         if active_color is None or self.board.turn != active_color or self.ai.is_terminal_for_training(self.board) or self.ai_thinking:
             return
@@ -2434,6 +2815,7 @@ Model: {self.ai.save_dir}""".strip()
         if self.is_training and self.learn_from_human_var.get():
             messagebox.showwarning("Warning", "Stop self-play training before starting a learning game")
             return
+        self.replay_mode = False
         self.board = chess.Board()
         self.human_color = color
         self.player_vs_player_mode = False
@@ -2458,6 +2840,7 @@ Model: {self.ai.save_dir}""".strip()
         if self.is_training and self.learn_from_human_var.get():
             messagebox.showwarning("Warning", "Stop self-play training before starting a learning game")
             return
+        self.replay_mode = False
         self.board = chess.Board()
         self.human_color = None
         self.player_vs_player_mode = True
@@ -2477,6 +2860,7 @@ Model: {self.ai.save_dir}""".strip()
         self.status_var.set("Player vs Player: White to move")
     
     def watch_ai_game(self):
+        self.replay_mode = False
         self.board = chess.Board()
         self.human_color = None
         self.player_vs_player_mode = False
@@ -2524,6 +2908,7 @@ Model: {self.ai.save_dir}""".strip()
         self.ai_vs_ai_running = False
         self.ai_vs_ai_paused = False
         self.pause_button.config(text="Pause", state=tk.DISABLED)
+        self.replay_mode = False
         self.board = chess.Board()
         self.human_color = None
         self.player_vs_player_mode = False
@@ -2555,6 +2940,11 @@ Model: {self.ai.save_dir}""".strip()
         messagebox.showinfo("Game Over", msg)
     
     def process_queue(self):
+        if self.ai.evaluation_replay_version != self._seen_evaluation_replays:
+            self._seen_evaluation_replays = self.ai.evaluation_replay_version
+            self.evaluation_replays = self.ai.last_evaluation_replays
+            self.replay_mode = bool(self.evaluation_replays)
+            self.restart_replay()
         try:
             while True:
                 msg = self.message_queue.get_nowait()
@@ -2570,6 +2960,76 @@ Model: {self.ai.save_dir}""".strip()
         except queue.Empty:
             pass
         self.window.after(100, self.process_queue)
+
+    def replay_replays_active(self):
+        return self.replay_mode and bool(self.evaluation_replays)
+
+    def replay_last_move(self):
+        if not self.evaluation_replays or self.replay_ply <= 0:
+            return None
+        return chess.Move.from_uci(
+            self.evaluation_replays[self.replay_game_index]['moves'][self.replay_ply - 1]
+        )
+
+    def update_replay_view(self):
+        if not self.evaluation_replays:
+            self.replay_info_var.set("Run an evaluation cycle to record games.")
+            return
+        game = self.evaluation_replays[self.replay_game_index]
+        self.replay_board = chess.Board(game['positions'][self.replay_ply])
+        evaluation = game['evaluations'][self.replay_ply - 1] if self.replay_ply else 0.0
+        self.replay_game_var.set(
+            f"Game {self.replay_game_index + 1}/{len(self.evaluation_replays)}"
+        )
+        self.replay_info_var.set(
+            f"{game.get('result', 'Unknown')} | Ply {self.replay_ply}/{len(game['moves'])} | "
+            f"Last move: {self.replay_last_move() or '-'} | Eval: {evaluation:+.3f}"
+        )
+        self.update_board_display()
+
+    def select_replay_game(self, offset):
+        if not self.evaluation_replays:
+            return
+        self.replay_mode = True
+        self.replay_playing = False
+        self.replay_game_index = (self.replay_game_index + offset) % len(self.evaluation_replays)
+        self.replay_ply = 0
+        self.update_replay_view()
+
+    def restart_replay(self):
+        if self.evaluation_replays:
+            self.replay_mode = True
+        self.replay_playing = False
+        self.replay_game_index = min(self.replay_game_index, max(0, len(self.evaluation_replays) - 1))
+        self.replay_ply = 0
+        self.update_replay_view()
+
+    def step_replay(self, direction):
+        if not self.evaluation_replays:
+            return
+        game = self.evaluation_replays[self.replay_game_index]
+        self.replay_ply = max(0, min(len(game['moves']), self.replay_ply + direction))
+        self.update_replay_view()
+
+    def toggle_replay(self):
+        if not self.evaluation_replays:
+            return
+        self.replay_playing = not self.replay_playing
+        self.replay_pause_button.config(text="Pause" if self.replay_playing else "Play")
+        if self.replay_playing:
+            self.advance_replay()
+
+    def advance_replay(self):
+        if not self.replay_playing or not self.evaluation_replays:
+            return
+        game = self.evaluation_replays[self.replay_game_index]
+        if self.replay_ply >= len(game['moves']):
+            self.replay_playing = False
+            self.replay_pause_button.config(text="Play")
+            return
+        self.replay_ply += 1
+        self.update_replay_view()
+        self.window.after(self.replay_delay_ms, self.advance_replay)
     
     def training_callback(self, game_num, total, p_loss, v_loss, reward, game_t, train_t):
         result = "Draw" if self.ai.is_draw_reward(reward) else ("Win(W)" if reward > 0 else "Win(B)")
@@ -2615,9 +3075,19 @@ Model: {self.ai.save_dir}""".strip()
             stockfish_start = float(self.stockfish_start_var.get())
             stockfish_end = float(self.stockfish_end_var.get())
             stockfish_decay = int(self.stockfish_decay_var.get())
+            resignation_threshold = float(self.resignation_threshold_var.get())
+            resignation_plies = int(self.resignation_plies_var.get())
+            opening_random_plies = int(self.opening_random_plies_var.get())
+            evaluation_games = int(self.evaluation_games_var.get())
+            evaluation_interval = int(self.evaluation_interval_var.get())
+            parallel_games = int(self.parallel_games_var.get())
             if num <= 0 or temp <= 0 or temp_threshold < 0 or mcts_sims <= 0 or mcts_batch <= 0 or train_steps < 0:
                 raise ValueError
             if not (0.0 <= stockfish_start <= 1.0 and 0.0 <= stockfish_end <= 1.0 and stockfish_decay > 0):
+                raise ValueError
+            if not (-1.0 <= resignation_threshold <= 1.0 and resignation_plies > 0 and
+                    opening_random_plies >= 0 and evaluation_games >= 0 and evaluation_interval > 0 and
+                    parallel_games > 0):
                 raise ValueError
         except:
             messagebox.showerror("Error", "Invalid input")
@@ -2635,6 +3105,12 @@ Model: {self.ai.save_dir}""".strip()
         self.ai.stockfish_teacher_start = stockfish_start
         self.ai.stockfish_teacher_end = stockfish_end
         self.ai.stockfish_teacher_decay_games = stockfish_decay
+        self.ai.resignation_threshold = resignation_threshold
+        self.ai.resignation_consecutive_plies = resignation_plies
+        self.ai.opening_random_plies = opening_random_plies
+        self.ai.evaluation_games = evaluation_games
+        self.ai.evaluation_interval = evaluation_interval
+        self.ai.parallel_games = parallel_games
         self.update_stats_display()
         self.is_training = True
         self.train_button.config(state=tk.DISABLED)
